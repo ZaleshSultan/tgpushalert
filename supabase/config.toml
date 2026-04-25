@@ -3,6 +3,12 @@ project_id = "tg-push-alert"
 [functions.sync-moodle-calendar]
 verify_jwt = false
 
+[functions.sync-steam-wishlist]
+verify_jwt = false
+
+[functions.sync-epic-games]
+verify_jwt = false
+
 [functions.dispatch-alerts]
 verify_jwt = false
 

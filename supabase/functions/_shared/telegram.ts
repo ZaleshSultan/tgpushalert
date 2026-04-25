@@ -1,4 +1,5 @@
 import { getOptionalEnv, getTelegramToken, HttpError } from "./env.ts";
+import { fetchWithTimeout } from "./http.ts";
 
 export interface InlineKeyboardButton {
   text: string;
@@ -49,12 +50,13 @@ export async function telegramApi<T>(
   payload: Record<string, unknown>,
 ): Promise<T> {
   const token = getTelegramToken();
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://api.telegram.org/bot${token}/${method}`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
+      label: `Telegram ${method}`,
     },
   );
   const data = await response.json() as TelegramResponse<T>;

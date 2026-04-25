@@ -10,6 +10,8 @@ select cron.unschedule(jobname)
 from cron.job
 where jobname in (
   'life-os-sync-moodle-calendar',
+  'life-os-sync-steam-wishlist',
+  'life-os-sync-epic-games',
   'life-os-dispatch-alerts'
 );
 
@@ -19,6 +21,38 @@ select cron.schedule(
   $$
   select net.http_post(
     url := 'https://PROJECT_REF.supabase.co/functions/v1/sync-moodle-calendar',
+    headers := jsonb_build_object(
+      'Content-Type', 'application/json',
+      'Authorization', 'Bearer SUPABASE_ANON_KEY',
+      'x-cron-secret', 'CRON_SECRET'
+    ),
+    body := jsonb_build_object('trigger', 'supabase-cron')
+  );
+  $$
+);
+
+select cron.schedule(
+  'life-os-sync-steam-wishlist',
+  '0 */12 * * *',
+  $$
+  select net.http_post(
+    url := 'https://PROJECT_REF.supabase.co/functions/v1/sync-steam-wishlist',
+    headers := jsonb_build_object(
+      'Content-Type', 'application/json',
+      'Authorization', 'Bearer SUPABASE_ANON_KEY',
+      'x-cron-secret', 'CRON_SECRET'
+    ),
+    body := jsonb_build_object('trigger', 'supabase-cron')
+  );
+  $$
+);
+
+select cron.schedule(
+  'life-os-sync-epic-games',
+  '0 */6 * * *',
+  $$
+  select net.http_post(
+    url := 'https://PROJECT_REF.supabase.co/functions/v1/sync-epic-games',
     headers := jsonb_build_object(
       'Content-Type', 'application/json',
       'Authorization', 'Bearer SUPABASE_ANON_KEY',

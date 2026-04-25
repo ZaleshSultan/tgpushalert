@@ -6,6 +6,7 @@ import {
   handleFunctionError,
   jsonResponse,
 } from "../_shared/env.ts";
+import { fetchTextWithTimeout } from "../_shared/http.ts";
 import { parseIcsCalendar } from "../_shared/ics.ts";
 import {
   ensureSource,
@@ -135,19 +136,13 @@ async function syncIcsSource(
       );
     }
 
-    const response = await fetch(icsUrl, {
+    const icsText = await fetchTextWithTimeout(icsUrl, {
+      label: `${config.name} ICS fetch`,
       headers: {
         accept: "text/calendar, text/plain;q=0.9, */*;q=0.1",
         "cache-control": "no-cache",
       },
     });
-    if (!response.ok) {
-      throw new Error(
-        `${config.name} ICS fetch failed: HTTP ${response.status}`,
-      );
-    }
-
-    const icsText = await response.text();
     const events = await parseIcsCalendar(icsText, {
       defaultTimeZone: timeZone,
       deriveDueAtFromStart: config.deriveDueAtFromStart,

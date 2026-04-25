@@ -1,11 +1,11 @@
 # Telegram Life OS Alert Bot
 
-Personal Telegram reminder service for Google Tasks, Google Calendar, Moodle LMS deadlines, and personal ICS schedules.
+Personal Telegram reminder service for Google Tasks, Google Calendar, Moodle LMS deadlines, personal ICS schedules, and game deal alerts.
 
 The project is now a hybrid runtime:
 
 - Supabase Postgres stores sources, normalized events, mute/cooldown state, sync runs, and bot metadata.
-- Supabase Edge Functions run ICS sync, alert dispatch, and Telegram webhook commands.
+- Supabase Edge Functions run ICS sync, game deal sync, alert dispatch, and Telegram webhook commands.
 - Supabase Cron invokes sync every 10 minutes and alert dispatch every 5 minutes.
 - Python runs only as a Google sync worker. It reads Google Calendar/Tasks and writes normalized rows to Supabase.
 - Telegram `/addtask` opens a step-by-step dialog and saves a personal task in `external_events`, optionally with a Telegram image.
@@ -18,9 +18,13 @@ Moodle is integrated only through the official calendar export ICS URL. No cooki
 ```
 Moodle calendar export (ICS)
 Personal calendar export (ICS)
+Steam public wishlist
+Epic Games Store promotions
         |
         v
 sync-moodle-calendar Edge Function
+sync-steam-wishlist Edge Function
+sync-epic-games Edge Function
         |
         v
 Supabase Postgres: sources, external_events, notification_state, muted_items, sync_runs
@@ -52,6 +56,11 @@ Required for Supabase Edge Functions:
 - `TELEGRAM_CHAT_ID`
 - `MOODLE_ICS_URL`
 - `PERSONAL_ICS_URL`, optional
+- `STEAM_ID64`
+- `STEAM_COUNTRY`, default `KZ`
+- `STEAM_LOCALE`, default `russian`
+- `EPIC_COUNTRY`, default `KZ`
+- `EPIC_LOCALE`, default `ru`
 - `CRON_SECRET`
 - `TELEGRAM_WEBHOOK_SECRET`
 - `APP_TIMEZONE`, default `Asia/Qyzylorda`
@@ -165,6 +174,11 @@ supabase secrets set TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
 supabase secrets set TELEGRAM_CHAT_ID=YOUR_CHAT_ID
 supabase secrets set MOODLE_ICS_URL="YOUR_MOODLE_ICS_EXPORT_URL"
 supabase secrets set PERSONAL_ICS_URL="YOUR_PERSONAL_ICS_EXPORT_URL"
+supabase secrets set STEAM_ID64=YOUR_PUBLIC_STEAM_ID64
+supabase secrets set STEAM_COUNTRY=KZ
+supabase secrets set STEAM_LOCALE=russian
+supabase secrets set EPIC_COUNTRY=KZ
+supabase secrets set EPIC_LOCALE=ru
 supabase secrets set CRON_SECRET=YOUR_RANDOM_CRON_SECRET
 supabase secrets set TELEGRAM_WEBHOOK_SECRET=YOUR_RANDOM_WEBHOOK_SECRET
 supabase secrets set APP_TIMEZONE=Asia/Qyzylorda
@@ -178,6 +192,8 @@ Deploy:
 
 ```powershell
 supabase functions deploy sync-moodle-calendar
+supabase functions deploy sync-steam-wishlist
+supabase functions deploy sync-epic-games
 supabase functions deploy dispatch-alerts
 supabase functions deploy telegram-webhook --no-verify-jwt
 ```
@@ -273,6 +289,8 @@ Run the SQL in the Supabase SQL editor.
 Schedules:
 
 - `sync-moodle-calendar`: every 10 minutes; syncs Moodle plus optional personal ICS feeds
+- `sync-steam-wishlist`: every 12 hours; checks public Steam wishlist discounts
+- `sync-epic-games`: every 6 hours; checks active Epic Games free giveaways
 - `dispatch-alerts`: every 5 minutes
 
 The Cron jobs invoke Edge Functions with the anon key plus `x-cron-secret`. The functions use service-role credentials from their own secrets.
@@ -291,6 +309,8 @@ $headers = @{
 }
 
 Invoke-RestMethod -Method Post -Uri "$base/sync-moodle-calendar" -Headers $headers
+Invoke-RestMethod -Method Post -Uri "$base/sync-steam-wishlist" -Headers $headers
+Invoke-RestMethod -Method Post -Uri "$base/sync-epic-games" -Headers $headers
 Invoke-RestMethod -Method Post -Uri "$base/dispatch-alerts" -Headers $headers
 ```
 

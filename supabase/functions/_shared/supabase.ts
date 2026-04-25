@@ -1,11 +1,14 @@
 import { getRequiredEnv } from "./env.ts";
+import { fetchWithTimeout } from "./http.ts";
 
 export type SourceKind =
   | "google_tasks"
   | "google_calendar"
   | "moodle_ics"
   | "personal_ics"
-  | "personal_tasks";
+  | "personal_tasks"
+  | "steam_wishlist"
+  | "epic_games";
 
 export interface SourceRow {
   id: string;
@@ -108,10 +111,11 @@ export async function supabaseRequest<T>(
     headers.set("content-type", "application/json");
   }
 
-  const response = await fetch(apiUrl(path), {
+  const response = await fetchWithTimeout(apiUrl(path), {
     method: options.method || "GET",
     headers,
     body: options.body,
+    label: `Supabase REST ${path}`,
   });
 
   if (!response.ok) {
