@@ -1,0 +1,10 @@
+project_id = "tg-push-alert"
+
+[functions.sync-moodle-calendar]
+verify_jwt = false
+
+[functions.dispatch-alerts]
+verify_jwt = false
+
+[functions.telegram-webhook]
+verify_jwt = false
