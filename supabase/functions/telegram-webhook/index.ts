@@ -506,6 +506,7 @@ async function handleCallback(query: TelegramCallbackQuery): Promise<void> {
   } else if (action === "mute") {
     const until = new Date(Date.now() + 45 * 60000);
     await muteEvent(eventId, until, "telegram_callback:mute_45m");
+    await resetNotificationState(eventId);
     await answerCallbackQuery(query.id, "Muted for 45 minutes");
     await editMessageText(
       message.chat.id,
@@ -517,6 +518,7 @@ async function handleCallback(query: TelegramCallbackQuery): Promise<void> {
   } else if (action === "tomorrow") {
     const until = tomorrowAtLocalHour(getAppTimezone(), 9);
     await muteEvent(eventId, until, "telegram_callback:tomorrow_9am");
+    await resetNotificationState(eventId);
     await answerCallbackQuery(query.id, "Snoozed until tomorrow");
     await editMessageText(
       message.chat.id,
@@ -548,6 +550,7 @@ async function handleGameDealCallback(
   if (action === "later") {
     const until = new Date(Date.now() + 24 * 60 * 60000);
     await muteEvent(eventId, until, "telegram_callback:game_deal_later_24h");
+    await resetNotificationState(eventId);
     await answerCallbackQuery(query.id, "Snoozed for 24 hours");
     await editMessageText(
       message.chat.id,
@@ -562,6 +565,7 @@ async function handleGameDealCallback(
   if (action === "no_money") {
     const until = new Date(Date.now() + 7 * 24 * 60 * 60000);
     await muteEvent(eventId, until, "telegram_callback:game_deal_no_money_7d");
+    await resetNotificationState(eventId);
     await answerCallbackQuery(query.id, "Muted for 7 days");
     await editMessageText(
       message.chat.id,
@@ -695,6 +699,16 @@ async function muteEvent(
       reason,
     }]),
   });
+}
+
+async function resetNotificationState(eventId: string): Promise<void> {
+  await supabaseRequest<null>(
+    `notification_state?${queryString({ event_id: `eq.${eventId}` })}`,
+    {
+      method: "DELETE",
+      headers: { prefer: "return=minimal" },
+    },
+  );
 }
 
 function assertTelegramWebhookSecret(req: Request): void {
