@@ -35,6 +35,10 @@ export function formatAlertMessage(
   event: ExternalEventRow,
   timeZone: string,
 ): string {
+  if (isGameDealEvent(event)) {
+    return formatGameDealAlertMessage(event, timeZone);
+  }
+
   const titleParts = splitEventTitle(event.title);
   const alertKind = resolveAlertKind(event);
   const when = formatAlertWhen(event, alertKind.iso, timeZone);
@@ -64,7 +68,31 @@ export function formatTodayLine(
   }`;
 }
 
-export function eventKeyboard(eventId: string): InlineKeyboardMarkup {
+export function eventKeyboard(event: ExternalEventRow): InlineKeyboardMarkup {
+  const eventId = event.id;
+  if (isGameDealEvent(event)) {
+    return {
+      inline_keyboard: [
+        [{
+          text: "✅ купил/забрал",
+          callback_data: `game_deal_done_${eventId}`,
+        }],
+        [{
+          text: "⏳ чуть позже",
+          callback_data: `game_deal_later_${eventId}`,
+        }],
+        [{
+          text: "💸 денег нет",
+          callback_data: `game_deal_no_money_${eventId}`,
+        }],
+        [{
+          text: "🙅 не интересно",
+          callback_data: `game_deal_not_interested_${eventId}`,
+        }],
+      ],
+    };
+  }
+
   return {
     inline_keyboard: [
       [{ text: "✅ done", callback_data: `event_done_${eventId}` }],
@@ -72,6 +100,102 @@ export function eventKeyboard(eventId: string): InlineKeyboardMarkup {
       [{ text: "📅 tomorrow", callback_data: `event_tomorrow_${eventId}` }],
     ],
   };
+}
+
+function isGameDealEvent(event: ExternalEventRow): boolean {
+  return event.sources?.kind === "steam_wishlist" ||
+    event.sources?.kind === "epic_games";
+}
+
+function formatGameDealAlertMessage(
+  event: ExternalEventRow,
+  timeZone: string,
+): string {
+  return event.sources?.kind === "steam_wishlist"
+    ? formatSteamDealAlertMessage(event)
+    : formatEpicDealAlertMessage(event, timeZone);
+}
+
+function formatSteamDealAlertMessage(event: ExternalEventRow): string {
+  const name = payloadString(event, "name") || stripSteamDealTitle(event.title);
+  const finalPriceKzt = payloadNumber(event, "final_price_kzt");
+  const originalPriceKzt = payloadNumber(event, "original_price_kzt");
+  const discountPercent = payloadNumber(event, "discount_percent");
+  const storeUrl = payloadString(event, "store_url") ||
+    `https://store.steampowered.com/app/${
+      encodeURIComponent(event.external_id)
+    }`;
+
+  return [
+    `🎮 <b>Steam скидка: ${escapeHtml(name)}</b>`,
+    `💸 <b>Цена:</b> ${escapeHtml(formatKztAmount(finalPriceKzt))}`,
+    `📉 <b>Скидка:</b> ${escapeHtml(formatDiscount(discountPercent))}`,
+    `🏷 <b>Было:</b> ${escapeHtml(formatKztAmount(originalPriceKzt))}`,
+    `🔗 ${escapeHtml(storeUrl)}`,
+  ].join("\n");
+}
+
+function formatEpicDealAlertMessage(
+  event: ExternalEventRow,
+  timeZone: string,
+): string {
+  const name = payloadString(event, "name") ||
+    payloadString(event, "title") ||
+    stripEpicDealTitle(event.title);
+  const storeUrl = payloadString(event, "store_url");
+  const dueAt = event.due_at ? formatRuDateTime(event.due_at, timeZone) : null;
+
+  return [
+    `🎁 <b>Забрать бесплатно: ${escapeHtml(name)}</b>`,
+    `🛒 <b>Магазин:</b> ${escapeHtml("Epic Games")}`,
+    `⏳ <b>До:</b> ${escapeHtml(dueAt || "неизвестно")}`,
+    storeUrl ? `🔗 ${escapeHtml(storeUrl)}` : null,
+  ].filter(Boolean).join("\n");
+}
+
+function payloadString(event: ExternalEventRow, key: string): string | null {
+  const value = event.raw_payload_json?.[key];
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function payloadNumber(event: ExternalEventRow, key: string): number | null {
+  const value = event.raw_payload_json?.[key];
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function stripSteamDealTitle(title: string): string {
+  return title.replace(/^🎮\s*Steam скидка:\s*/u, "")
+    .replace(/\s+—\s+-\d+(?:[.,]\d+)?%$/u, "")
+    .trim() || title;
+}
+
+function stripEpicDealTitle(title: string): string {
+  return title.replace(/^🎁\s*Бесплатно в Epic Games:\s*/u, "").trim() ||
+    title;
+}
+
+function formatKztAmount(value: number | null): string {
+  if (value === null) {
+    return "неизвестно";
+  }
+  return `${formatDealNumber(value)} ₸`;
+}
+
+function formatDiscount(value: number | null): string {
+  return value === null ? "неизвестно" : `-${formatDealNumber(value)}%`;
+}
+
+function formatDealNumber(value: number): string {
+  return new Intl.NumberFormat("ru-RU", {
+    maximumFractionDigits: Number.isInteger(value) ? 0 : 2,
+  }).format(value);
 }
 
 function formatWhen(

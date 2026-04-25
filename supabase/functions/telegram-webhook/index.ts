@@ -479,6 +479,15 @@ async function handleCallback(query: TelegramCallbackQuery): Promise<void> {
   }
 
   const data = query.data || "";
+  const gameDealMatch = data.match(
+    /^game_deal_(done|later|no_money|not_interested)_([0-9a-f-]{36})$/i,
+  );
+  if (gameDealMatch) {
+    const [, action, eventId] = gameDealMatch;
+    await handleGameDealCallback(query, message, action, eventId);
+    return;
+  }
+
   const match = data.match(/^event_(done|mute|tomorrow)_([0-9a-f-]{36})$/i);
   if (!match) {
     await answerCallbackQuery(query.id, "Unsupported action");
@@ -515,6 +524,62 @@ async function handleCallback(query: TelegramCallbackQuery): Promise<void> {
       `📅 Snoozed until ${
         escapeHtml(formatDateTime(until.toISOString(), getAppTimezone()))
       }.`,
+    );
+  }
+}
+
+async function handleGameDealCallback(
+  query: TelegramCallbackQuery,
+  message: TelegramMessage,
+  action: string,
+  eventId: string,
+): Promise<void> {
+  if (action === "done") {
+    await updateEventStatus(eventId, "done");
+    await answerCallbackQuery(query.id, "Marked done");
+    await editMessageText(
+      message.chat.id,
+      message.message_id,
+      "✅ Куплено/забрано.",
+    );
+    return;
+  }
+
+  if (action === "later") {
+    const until = new Date(Date.now() + 24 * 60 * 60000);
+    await muteEvent(eventId, until, "telegram_callback:game_deal_later_24h");
+    await answerCallbackQuery(query.id, "Snoozed for 24 hours");
+    await editMessageText(
+      message.chat.id,
+      message.message_id,
+      `⏳ Напомню позже: ${
+        escapeHtml(formatDateTime(until.toISOString(), getAppTimezone()))
+      }.`,
+    );
+    return;
+  }
+
+  if (action === "no_money") {
+    const until = new Date(Date.now() + 7 * 24 * 60 * 60000);
+    await muteEvent(eventId, until, "telegram_callback:game_deal_no_money_7d");
+    await answerCallbackQuery(query.id, "Muted for 7 days");
+    await editMessageText(
+      message.chat.id,
+      message.message_id,
+      `💸 Отложено до ${
+        escapeHtml(formatDateTime(until.toISOString(), getAppTimezone()))
+      }.`,
+    );
+    return;
+  }
+
+  if (action === "not_interested") {
+    await updateEventStatus(eventId, "cancelled");
+    await answerCallbackQuery(query.id, "Cancelled");
+    await editMessageText(
+      message.chat.id,
+      message.message_id,
+      "🙅 Больше не интересно.",
     );
   }
 }
@@ -603,7 +668,7 @@ async function loadActiveEvents(): Promise<ExternalEventRow[]> {
 
 async function updateEventStatus(
   eventId: string,
-  status: "done",
+  status: "done" | "cancelled",
 ): Promise<void> {
   await supabaseRequest<null>(
     `external_events?${queryString({ id: `eq.${eventId}` })}`,

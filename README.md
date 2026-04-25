@@ -56,9 +56,12 @@ Required for Supabase Edge Functions:
 - `TELEGRAM_CHAT_ID`
 - `MOODLE_ICS_URL`
 - `PERSONAL_ICS_URL`, optional
-- `STEAM_ID64`
+- `STEAM_ID64`, required unless `STEAM_VANITY` is set
+- `STEAM_VANITY`, optional public vanity profile name, for example `zalewko`
 - `STEAM_COUNTRY`, default `KZ`
 - `STEAM_LOCALE`, default `russian`
+- `STEAM_MIN_DISCOUNT_PERCENT`, default `70`
+- `STEAM_MAX_PRICE_KZT`, default `3500`
 - `EPIC_COUNTRY`, default `KZ`
 - `EPIC_LOCALE`, default `ru`
 - `CRON_SECRET`
@@ -175,8 +178,11 @@ supabase secrets set TELEGRAM_CHAT_ID=YOUR_CHAT_ID
 supabase secrets set MOODLE_ICS_URL="YOUR_MOODLE_ICS_EXPORT_URL"
 supabase secrets set PERSONAL_ICS_URL="YOUR_PERSONAL_ICS_EXPORT_URL"
 supabase secrets set STEAM_ID64=YOUR_PUBLIC_STEAM_ID64
+supabase secrets set STEAM_VANITY=zalewko
 supabase secrets set STEAM_COUNTRY=KZ
 supabase secrets set STEAM_LOCALE=russian
+supabase secrets set STEAM_MIN_DISCOUNT_PERCENT=70
+supabase secrets set STEAM_MAX_PRICE_KZT=3500
 supabase secrets set EPIC_COUNTRY=KZ
 supabase secrets set EPIC_LOCALE=ru
 supabase secrets set CRON_SECRET=YOUR_RANDOM_CRON_SECRET
@@ -289,7 +295,7 @@ Run the SQL in the Supabase SQL editor.
 Schedules:
 
 - `sync-moodle-calendar`: every 10 minutes; syncs Moodle plus optional personal ICS feeds
-- `sync-steam-wishlist`: every 12 hours; checks public Steam wishlist discounts
+- `sync-steam-wishlist`: every 12 hours; checks public Steam wishlist discounts. It first tries Steam `wishlistdata`, then falls back to the public wishlist HTML page plus `api/appdetails` when Steam returns HTML instead of JSON. If Steam's HTML shell no longer embeds app IDs, it uses the public wishlist service to recover the app list before checking prices. Steam deals are sent only when the game is free, discount is at least `STEAM_MIN_DISCOUNT_PERCENT`, or final price is at most `STEAM_MAX_PRICE_KZT`.
 - `sync-epic-games`: every 6 hours; checks active Epic Games free giveaways
 - `dispatch-alerts`: every 5 minutes
 

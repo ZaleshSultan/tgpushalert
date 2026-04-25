@@ -103,7 +103,7 @@ Deno.serve(async (req) => {
       }
 
       const message = formatAlertMessage(candidate.event, timeZone);
-      const keyboard = eventKeyboard(candidate.event.id);
+      const keyboard = eventKeyboard(candidate.event);
       const photoId = telegramPhotoId(candidate.event);
       if (photoId) {
         await sendTelegramPhoto(
