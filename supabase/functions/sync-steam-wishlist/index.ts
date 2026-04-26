@@ -6,7 +6,12 @@ import {
   jsonResponse,
 } from "../_shared/env.ts";
 import { sha256Hex } from "../_shared/checksum.ts";
+import { classifyDeal, type DealKind } from "../_shared/deals.ts";
 import { fetchJsonWithTimeout, fetchTextWithTimeout } from "../_shared/http.ts";
+import {
+  resolveSteamDeal,
+  type SteamPriceCandidate,
+} from "../_shared/steam.ts";
 import {
   ensureSource,
   type ExternalEventUpsert,
@@ -20,8 +25,6 @@ const SOURCE_KIND = "steam_wishlist";
 const SOURCE_NAME = "Steam Wishlist";
 const DEFAULT_COUNTRY = "KZ";
 const DEFAULT_LOCALE = "russian";
-const DEFAULT_MIN_DISCOUNT_PERCENT = 70;
-const DEFAULT_MAX_PRICE_KZT = 3500;
 const APPDETAILS_CONCURRENCY = 5;
 const STEAM_HEADERS = {
   accept: "application/json, text/html;q=0.9, */*;q=0.1",
@@ -31,7 +34,6 @@ const STEAM_HEADERS = {
 };
 
 type FetchMode = "wishlistdata" | "html_appdetails_fallback";
-type SteamDealKind = "free_claim" | "huge_discount" | "low_price";
 
 interface SyncResponse {
   success: boolean;
@@ -51,8 +53,6 @@ interface SteamConfig {
   vanity: string | null;
   country: string;
   locale: string;
-  minDiscountPercent: number;
-  maxPriceKzt: number;
 }
 
 interface BuildRowsResult {
@@ -67,23 +67,10 @@ interface BuildRowsResult {
 interface DiscountedSteamOffer {
   raw: Record<string, unknown>;
   discountPct: number;
-  finalPrice: number | null;
-  originalPrice: number | null;
+  finalPriceMinor: number | null;
+  originalPriceMinor: number | null;
   finalFormatted: string | null;
   originalFormatted: string | null;
-}
-
-interface SteamDealClassification {
-  dealKind: SteamDealKind;
-  finalPriceKzt: number | null;
-  originalPriceKzt: number | null;
-}
-
-interface SteamAppDetailsResponse {
-  [appId: string]: {
-    success?: boolean;
-    data?: unknown;
-  };
 }
 
 interface SteamWishlistServiceResponse {
@@ -120,6 +107,7 @@ async function syncSteamWishlist(): Promise<SyncResponse> {
     sourceId = source.id;
 
     if (!source.is_enabled) {
+      console.log("[sync-steam-wishlist] source disabled");
       return {
         success: true,
         ok: true,
@@ -137,11 +125,21 @@ async function syncSteamWishlist(): Promise<SyncResponse> {
     runId = run.id;
 
     const config = steamConfig();
+    console.log("[sync-steam-wishlist] started", {
+      sourceId: source.id,
+      steamId: config.steamId,
+      vanity: config.vanity,
+      country: config.country,
+      locale: config.locale,
+    });
+
     let result: BuildRowsResult;
     try {
       result = await buildRowsFromWishlistData(source.id, config);
     } catch (error) {
-      errors.push(`wishlistdata: ${errorMessage(error)}`);
+      const message = `wishlistdata: ${errorMessage(error)}`;
+      console.warn("[sync-steam-wishlist] wishlistdata failed", { message });
+      errors.push(message);
       result = await buildRowsFromHtmlFallback(source.id, config);
     }
 
@@ -158,6 +156,15 @@ async function syncSteamWishlist(): Promise<SyncResponse> {
       result.cleanupExternalIds,
     );
 
+    console.log("[sync-steam-wishlist] completed", {
+      fetchMode,
+      processed,
+      upserted,
+      skipped,
+      missing,
+      errors: errors.length,
+    });
+
     await finishSyncRun(run.id, "success", processed, upserted);
     return {
       success: true,
@@ -172,7 +179,14 @@ async function syncSteamWishlist(): Promise<SyncResponse> {
       errors,
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
+    console.error("[sync-steam-wishlist] failed", {
+      message,
+      processed,
+      upserted,
+      skipped,
+      fetchMode,
+    });
     if (runId) {
       await finishSyncRun(runId, "error", processed, upserted, message);
     }
@@ -204,22 +218,12 @@ function steamConfig(): SteamConfig {
     .toUpperCase() || DEFAULT_COUNTRY;
   const locale = getOptionalEnv("STEAM_LOCALE", DEFAULT_LOCALE).trim() ||
     DEFAULT_LOCALE;
-  const minDiscountPercent = optionalNumberEnv(
-    "STEAM_MIN_DISCOUNT_PERCENT",
-    DEFAULT_MIN_DISCOUNT_PERCENT,
-  );
-  const maxPriceKzt = optionalNumberEnv(
-    "STEAM_MAX_PRICE_KZT",
-    DEFAULT_MAX_PRICE_KZT,
-  );
 
   return {
     steamId,
     vanity,
     country,
     locale,
-    minDiscountPercent,
-    maxPriceKzt,
   };
 }
 
@@ -235,6 +239,7 @@ async function buildRowsFromWishlistData(
   const wishlist = parseWishlistJson(body);
   const nowIso = new Date().toISOString();
   const rows: ExternalEventUpsert[] = [];
+  const errors: string[] = [];
   let processed = 0;
   let skipped = 0;
 
@@ -245,35 +250,59 @@ async function buildRowsFromWishlistData(
       continue;
     }
 
-    const bestOffer = bestDiscountedSub(game);
-    if (!bestOffer) {
+    const candidate = bestDiscountedSub(game);
+    if (!candidate) {
       skipped += 1;
       continue;
     }
 
-    const deal = classifySteamDeal(bestOffer, config);
-    if (!deal) {
-      skipped += 1;
-      continue;
-    }
-
-    rows.push(
-      await steamDiscountEventRow({
-        sourceId,
-        appId,
-        name: stringValue(game.name) || `Steam app ${appId}`,
-        offer: bestOffer,
-        deal,
-        nowIso,
+    try {
+      const resolved = await resolveSteamDeal(appId, {
         country: config.country,
         locale: config.locale,
-        fetchMode: "wishlistdata",
-        sourcePayload: {
-          wishlist_game: game,
-          selected_sub: bestOffer.raw,
-        },
-      }),
-    );
+        headers: STEAM_HEADERS,
+      }, steamPriceCandidate(candidate));
+      if (!resolved) {
+        skipped += 1;
+        continue;
+      }
+
+      const dealKind = classifyDeal({
+        finalPriceKzt: resolved.finalPriceKzt,
+        discountPercent: resolved.discountPercent,
+      });
+      if (dealKind === "ignore") {
+        skipped += 1;
+        continue;
+      }
+
+      rows.push(
+        await steamDiscountEventRow({
+          sourceId,
+          appId,
+          name: stringValue(game.name) || resolved.name ||
+            `Игра Steam ${appId}`,
+          resolved,
+          dealKind,
+          nowIso,
+          country: config.country,
+          locale: config.locale,
+          fetchMode: "wishlistdata",
+          sourcePayload: {
+            wishlist_game: game,
+            selected_sub: candidate.raw,
+          },
+        }),
+      );
+    } catch (error) {
+      skipped += 1;
+      const message = `wishlist app ${appId}: ${errorMessage(error)}`;
+      console.warn("[sync-steam-wishlist] item parse error", {
+        appId,
+        message,
+      });
+      errors.push(message);
+    }
   }
 
   return {
@@ -282,7 +311,7 @@ async function buildRowsFromWishlistData(
     processed,
     skipped,
     cleanupExternalIds: new Set(rows.map((row) => row.external_id)),
-    errors: [],
+    errors,
   };
 }
 
@@ -297,7 +326,7 @@ async function buildRowsFromHtmlFallback(
   const appIds = await fallbackWishlistAppIds(html, config);
   if (appIds.length === 0) {
     throw new Error(
-      "Steam wishlist page fallback did not expose any appids in HTML",
+      "Steam wishlist page fallback did not expose any app ids in HTML",
     );
   }
 
@@ -311,7 +340,7 @@ async function buildRowsFromHtmlFallback(
     const batch = appIds.slice(index, index + APPDETAILS_CONCURRENCY);
     const results = await Promise.all(
       batch.map((appId) =>
-        appDetailsEventRow({
+        htmlFallbackEventRow({
           sourceId,
           appId,
           nowIso,
@@ -331,6 +360,10 @@ async function buildRowsFromHtmlFallback(
       }
       skipped += 1;
       if (result.error) {
+        console.warn("[sync-steam-wishlist] html fallback parse error", {
+          appId: result.appId,
+          message: result.error,
+        });
         errors.push(result.error);
       }
     }
@@ -344,6 +377,63 @@ async function buildRowsFromHtmlFallback(
     cleanupExternalIds,
     errors,
   };
+}
+
+async function htmlFallbackEventRow(params: {
+  sourceId: string;
+  appId: string;
+  nowIso: string;
+  config: SteamConfig;
+}): Promise<{
+  appId: string;
+  row: ExternalEventUpsert | null;
+  keepActive: boolean;
+  error: string | null;
+}> {
+  const { sourceId, appId, nowIso, config } = params;
+  try {
+    const resolved = await resolveSteamDeal(appId, {
+      country: config.country,
+      locale: config.locale,
+      headers: STEAM_HEADERS,
+    });
+    if (!resolved) {
+      return { appId, row: null, keepActive: false, error: null };
+    }
+
+    const dealKind = classifyDeal({
+      finalPriceKzt: resolved.finalPriceKzt,
+      discountPercent: resolved.discountPercent,
+    });
+    if (dealKind === "ignore") {
+      return { appId, row: null, keepActive: false, error: null };
+    }
+
+    return {
+      appId,
+      row: await steamDiscountEventRow({
+        sourceId,
+        appId,
+        name: resolved.name || `Игра Steam ${appId}`,
+        resolved,
+        dealKind,
+        nowIso,
+        country: config.country,
+        locale: config.locale,
+        fetchMode: "html_appdetails_fallback",
+        sourcePayload: {},
+      }),
+      keepActive: false,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      appId,
+      row: null,
+      keepActive: true,
+      error: `html fallback ${appId}: ${errorMessage(error)}`,
+    };
+  }
 }
 
 async function fallbackWishlistAppIds(
@@ -413,12 +503,12 @@ function bestDiscountedSub(
     .map((sub) => ({
       raw: sub,
       discountPct: numberValue(sub.discount_pct) || 0,
-      finalPrice: numberValue(sub.discount_price) ??
+      finalPriceMinor: numberValue(sub.discount_price) ??
         numberValue(sub.final_price) ??
         numberValue(sub.discounted_price) ??
         discountBlockFinalPrice(sub) ??
         numberValue(sub.price),
-      originalPrice: numberValue(sub.original_price) ??
+      originalPriceMinor: numberValue(sub.original_price) ??
         numberValue(sub.orig_price),
       finalFormatted: stringValue(sub.formatted_price) ||
         stringValue(sub.formatted_final_price) ||
@@ -435,89 +525,21 @@ function bestDiscountedSub(
       return discountDiff;
     }
 
-    return priceForSort(left.finalPrice) - priceForSort(right.finalPrice);
+    return priceForSort(left.finalPriceMinor) -
+      priceForSort(right.finalPriceMinor);
   });
 
   return discounted[0] || null;
 }
 
-async function appDetailsEventRow(params: {
-  sourceId: string;
-  appId: string;
-  nowIso: string;
-  config: SteamConfig;
-}): Promise<{
-  appId: string;
-  row: ExternalEventUpsert | null;
-  keepActive: boolean;
-  error: string | null;
-}> {
-  const { sourceId, appId, nowIso, config } = params;
-  try {
-    const appDetails = await fetchSteamAppDetails(appId, config);
-    if (!appDetails.success || !isRecord(appDetails.data)) {
-      return { appId, row: null, keepActive: false, error: null };
-    }
-
-    const offer = appDetailsDiscountOffer(appDetails.data);
-    if (!offer) {
-      return { appId, row: null, keepActive: false, error: null };
-    }
-    const deal = classifySteamDeal(offer, config);
-    if (!deal) {
-      return { appId, row: null, keepActive: false, error: null };
-    }
-
-    return {
-      appId,
-      row: await steamDiscountEventRow({
-        sourceId,
-        appId,
-        name: stringValue(appDetails.data.name) || `Steam app ${appId}`,
-        offer,
-        deal,
-        nowIso,
-        country: config.country,
-        locale: config.locale,
-        fetchMode: "html_appdetails_fallback",
-        sourcePayload: {
-          appdetails: appDetails.data,
-        },
-      }),
-      keepActive: false,
-      error: null,
-    };
-  } catch (error) {
-    return {
-      appId,
-      row: null,
-      keepActive: true,
-      error: `appdetails ${appId}: ${errorMessage(error)}`,
-    };
-  }
-}
-
-async function fetchSteamAppDetails(
-  appId: string,
-  config: SteamConfig,
-): Promise<{ success: boolean; data?: unknown }> {
-  const params = new URLSearchParams({
-    appids: appId,
-    cc: config.country,
-    l: config.locale,
-    filters: "price_overview,basic",
-  });
-  const payload = await fetchJsonWithTimeout<SteamAppDetailsResponse>(
-    `https://store.steampowered.com/api/appdetails?${params.toString()}`,
-    {
-      label: `Steam appdetails ${appId}`,
-      headers: STEAM_HEADERS,
-    },
-  );
-  const details = payload[appId];
+function steamPriceCandidate(offer: DiscountedSteamOffer): SteamPriceCandidate {
   return {
-    success: details?.success === true,
-    data: details?.data,
+    discountPercent: offer.discountPct,
+    finalPriceMinor: offer.finalPriceMinor,
+    originalPriceMinor: offer.originalPriceMinor,
+    finalFormatted: offer.finalFormatted,
+    originalFormatted: offer.originalFormatted,
+    raw: offer.raw,
   };
 }
 
@@ -550,35 +572,14 @@ async function fetchWishlistServiceAppIds(steamId: string): Promise<string[]> {
   return [...ids];
 }
 
-function appDetailsDiscountOffer(
-  appDetails: Record<string, unknown>,
-): DiscountedSteamOffer | null {
-  const priceOverview = recordValue(appDetails.price_overview);
-  if (!priceOverview) {
-    return null;
-  }
-
-  const discountPct = numberValue(priceOverview.discount_percent) || 0;
-  if (discountPct <= 0) {
-    return null;
-  }
-
-  return {
-    raw: priceOverview,
-    discountPct,
-    finalPrice: numberValue(priceOverview.final),
-    originalPrice: numberValue(priceOverview.initial),
-    finalFormatted: stringValue(priceOverview.final_formatted),
-    originalFormatted: stringValue(priceOverview.initial_formatted),
-  };
-}
-
 async function steamDiscountEventRow(params: {
   sourceId: string;
   appId: string;
   name: string;
-  offer: DiscountedSteamOffer;
-  deal: SteamDealClassification;
+  resolved: Awaited<ReturnType<typeof resolveSteamDeal>> extends infer T
+    ? Exclude<T, null>
+    : never;
+  dealKind: Exclude<DealKind, "ignore">;
   nowIso: string;
   country: string;
   locale: string;
@@ -589,96 +590,64 @@ async function steamDiscountEventRow(params: {
     sourceId,
     appId,
     name,
-    offer,
-    deal,
+    resolved,
+    dealKind,
     nowIso,
     country,
     locale,
     fetchMode,
     sourcePayload,
   } = params;
-  const storeUrl = `https://store.steampowered.com/app/${
-    encodeURIComponent(appId)
-  }`;
-  const priceLine = steamPriceLine(offer);
   const checksum = await sha256Hex([
     SOURCE_KIND,
     appId,
-    offer.discountPct,
-    offer.finalPrice ?? "",
+    dealKind,
+    resolved.discountPercent,
+    resolved.finalPriceKzt,
+    resolved.originalPriceKzt,
   ].join("|"));
 
   return {
     source_id: sourceId,
     external_id: appId,
-    title: `🎮 Steam скидка: ${name} — -${offer.discountPct}%`,
+    title: name,
     description: [
       `Игра: ${name}`,
-      `Скидка: -${offer.discountPct}%`,
-      priceLine ? `Цена: ${priceLine}` : null,
-      `Ссылка: ${storeUrl}`,
-    ].filter(Boolean).join("\n"),
+      `Цена: ${
+        formatPriceLine(resolved.finalPriceKzt, resolved.originalPriceKzt)
+      }`,
+      `Скидка: ${resolved.discountPercent}%`,
+      `Ссылка: ${resolved.storeUrl}`,
+    ].join("\n"),
     location: null,
     starts_at: null,
     ends_at: null,
-    due_at: nowIso,
+    due_at: null,
     due_date: null,
     has_explicit_time: true,
-    remind_at: null,
+    remind_at: nowIso,
     raw_payload_json: {
       source_kind: SOURCE_KIND,
       fetch_mode: fetchMode,
-      deal_kind: deal.dealKind,
+      price_source: resolved.source,
+      deal_kind: dealKind,
       store: "steam",
       app_id: appId,
       name,
-      discount_percent: offer.discountPct,
-      final_price_kzt: deal.finalPriceKzt,
-      original_price_kzt: deal.originalPriceKzt,
+      final_price_kzt: resolved.finalPriceKzt,
+      original_price_kzt: resolved.originalPriceKzt,
+      discount_percent: resolved.discountPercent,
+      store_url: resolved.storeUrl,
       country,
       locale,
-      store_url: storeUrl,
-      should_create_google_task: deal.dealKind === "free_claim",
+      should_create_google_task: dealKind === "free",
       should_push_telegram: true,
+      steam_price: resolved.raw,
       ...sourcePayload,
     },
     checksum,
     status: "active",
   };
-}
-
-function classifySteamDeal(
-  offer: DiscountedSteamOffer,
-  config: SteamConfig,
-): SteamDealClassification | null {
-  const finalPriceKzt = kztFromSteamPrice(offer.finalPrice);
-  const originalPriceKzt = kztFromSteamPrice(offer.originalPrice);
-
-  if (finalPriceKzt === 0 || offer.discountPct === 100) {
-    return {
-      dealKind: "free_claim",
-      finalPriceKzt,
-      originalPriceKzt,
-    };
-  }
-
-  if (offer.discountPct >= config.minDiscountPercent) {
-    return {
-      dealKind: "huge_discount",
-      finalPriceKzt,
-      originalPriceKzt,
-    };
-  }
-
-  if (finalPriceKzt !== null && finalPriceKzt <= config.maxPriceKzt) {
-    return {
-      dealKind: "low_price",
-      finalPriceKzt,
-      originalPriceKzt,
-    };
-  }
-
-  return null;
 }
 
 function extractWishlistAppIds(html: string): string[] {
@@ -767,17 +736,6 @@ function extractSteamIdFromWishlistHtml(html: string): string | null {
   return null;
 }
 
-function steamPriceLine(offer: DiscountedSteamOffer): string | null {
-  const finalText = offer.finalFormatted || formatKztMinor(offer.finalPrice);
-  const originalText = offer.originalFormatted ||
-    formatKztMinor(offer.originalPrice);
-
-  if (finalText && originalText) {
-    return `${finalText} (было ${originalText})`;
-  }
-  return finalText || originalText;
-}
-
 function discountBlockFinalPrice(sub: Record<string, unknown>): number | null {
   const html = stringValue(sub.discount_block);
   if (!html) {
@@ -810,6 +768,19 @@ function discountBlockText(
   return decodeHtmlEntities(match[1].replace(/<[^>]+>/g, " "))
     .replace(/\s+/g, " ")
     .trim() || null;
+}
+
+function formatPriceLine(
+  finalPriceKzt: number,
+  originalPriceKzt: number,
+): string {
+  return `${formatKzt(finalPriceKzt)} (было ${formatKzt(originalPriceKzt)})`;
+}
+
+function formatKzt(value: number): string {
+  return new Intl.NumberFormat("ru-RU", {
+    maximumFractionDigits: Number.isInteger(value) ? 0 : 2,
+  }).format(value) + "₸";
 }
 
 function decodeHtmlEntities(value: string): string {
@@ -849,23 +820,6 @@ function priceForSort(value: number | null): number {
   return value ?? Number.POSITIVE_INFINITY;
 }
 
-function optionalNumberEnv(name: string, fallback: number): number {
-  const raw = getOptionalEnv(name);
-  if (!raw) {
-    return fallback;
-  }
-
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value < 0) {
-    throw new Error(`${name} must be zero or a positive number`);
-  }
-  return value;
-}
-
-function kztFromSteamPrice(value: number | null): number | null {
-  return value === null ? null : value / 100;
-}
-
 function recordValue(value: unknown): Record<string, unknown> | null {
   return isRecord(value) ? value : null;
 }
@@ -883,16 +837,6 @@ function numberValue(value: unknown): number | null {
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function formatKztMinor(value: number | null): string | null {
-  if (value === null) {
-    return null;
-  }
-  return new Intl.NumberFormat("ru-RU", {
-    style: "currency",
-    currency: "KZT",
-  }).format(value / 100);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

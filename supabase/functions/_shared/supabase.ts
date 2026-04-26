@@ -86,6 +86,32 @@ export interface SyncRunRow {
   items_seen: number;
   items_upserted: number;
   error_text: string | null;
+  sources?: Pick<SourceRow, "kind" | "name"> | null;
+}
+
+export interface TaskCommandInsert {
+  chat_id: string;
+  title: string;
+  due_date: string;
+  due_time?: string | null;
+  timezone: string;
+}
+
+export interface EventUserActionRow {
+  id: string;
+  event_id: string;
+  chat_id: string;
+  action: "done" | "later" | "no_money" | "not_interested";
+  payload_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EventUserActionUpsert {
+  event_id: string;
+  chat_id: string;
+  action: "done" | "later" | "no_money" | "not_interested";
+  payload_json?: Record<string, unknown>;
 }
 
 type RequestOptions = {
@@ -250,4 +276,25 @@ export async function markMissingEvents(
     },
   );
   return missingIds.length;
+}
+
+export async function enqueueTaskCommand(
+  row: TaskCommandInsert,
+): Promise<void> {
+  await supabaseRequest<null>("task_commands", {
+    method: "POST",
+    headers: { prefer: "return=minimal" },
+    body: JSON.stringify([row]),
+  });
+}
+
+export async function upsertEventUserAction(
+  row: EventUserActionUpsert,
+): Promise<void> {
+  const params = queryString({ on_conflict: "event_id,chat_id" });
+  await supabaseRequest<null>(`event_user_actions?${params}`, {
+    method: "POST",
+    headers: { prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([row]),
+  });
 }

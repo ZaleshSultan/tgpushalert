@@ -1,3 +1,12 @@
+import {
+  dealAlertType,
+  dealKindLabel,
+  dealSortWeight,
+  formatDiscountPercent,
+  formatKztAmount,
+  getDealSnapshot,
+  isGameDealEvent,
+} from "./deals.ts";
 import type { ExternalEventRow } from "./supabase.ts";
 import type { InlineKeyboardMarkup } from "./telegram.ts";
 import { escapeHtml } from "./telegram.ts";
@@ -7,6 +16,11 @@ export function chooseAlertType(
   event: ExternalEventRow,
   now = new Date(),
 ): string | null {
+  if (isGameDealEvent(event)) {
+    const deal = getDealSnapshot(event);
+    return deal ? dealAlertType(deal.dealKind) : null;
+  }
+
   const iso = eventTimeIso(event);
   if (!iso) {
     return null;
@@ -36,7 +50,7 @@ export function formatAlertMessage(
   timeZone: string,
 ): string {
   if (isGameDealEvent(event)) {
-    return formatGameDealAlertMessage(event, timeZone);
+    return formatGameDealAlertMessage(event);
   }
 
   const titleParts = splitEventTitle(event.title);
@@ -48,7 +62,7 @@ export function formatAlertMessage(
     `${alertKind.emoji} <b>${alertKind.label}: ${
       escapeHtml(titleParts.subject)
     }</b>`,
-    `📌 <b>Задание/Событие:</b> ${escapeHtml(titleParts.name)}`,
+    `📌 <b>Задача/событие:</b> ${escapeHtml(titleParts.name)}`,
     when ? `⏰ <b>${alertKind.timeLabel}:</b> ${escapeHtml(when)}` : null,
     description ? `📝 <i>${escapeHtml(description)}</i>` : null,
   ].filter(Boolean);
@@ -60,12 +74,58 @@ export function formatTodayLine(
   event: ExternalEventRow,
   timeZone: string,
 ): string {
+  if (isGameDealEvent(event)) {
+    return formatDealListLine(event, timeZone);
+  }
+
   const iso = eventTimeIso(event);
   const source = event.sources?.name || "Life OS";
   const when = formatWhen(event, timeZone, iso);
   return `- ${escapeHtml(when)} | ${escapeHtml(source)} | ${
     escapeHtml(event.title)
   }`;
+}
+
+export function formatDealListLine(
+  event: ExternalEventRow,
+  timeZone: string,
+): string {
+  const deal = getDealSnapshot(event);
+  if (!deal) {
+    return `- ${escapeHtml(event.title)}`;
+  }
+
+  const endAt = event.ends_at || event.due_at;
+  const timeSuffix = deal.dealKind === "free" && endAt
+    ? ` до ${escapeHtml(formatDateTime(endAt, timeZone))}`
+    : "";
+
+  return [
+    `- ${escapeHtml(deal.storeLabel)} | ${escapeHtml(deal.name)}`,
+    `  ${escapeHtml(dealKindLabel(deal.dealKind))} | ${
+      escapeHtml(formatKztAmount(deal.finalPriceKzt))
+    } (было ${escapeHtml(formatKztAmount(deal.originalPriceKzt))}, -${
+      escapeHtml(formatDiscountPercent(deal.discountPercent))
+    })${timeSuffix}`,
+  ].join("\n");
+}
+
+export function compareDealEvents(
+  left: ExternalEventRow,
+  right: ExternalEventRow,
+): number {
+  const leftDeal = getDealSnapshot(left);
+  const rightDeal = getDealSnapshot(right);
+  const leftWeight = leftDeal ? dealSortWeight(leftDeal.dealKind) : 99;
+  const rightWeight = rightDeal ? dealSortWeight(rightDeal.dealKind) : 99;
+  if (leftWeight !== rightWeight) {
+    return leftWeight - rightWeight;
+  }
+
+  const leftUpdated = left.updated_at || "";
+  const rightUpdated = right.updated_at || "";
+  return rightUpdated.localeCompare(leftUpdated) ||
+    left.title.localeCompare(right.title, "ru");
 }
 
 export function eventKeyboard(event: ExternalEventRow): InlineKeyboardMarkup {
@@ -86,7 +146,7 @@ export function eventKeyboard(event: ExternalEventRow): InlineKeyboardMarkup {
           callback_data: `game_deal_no_money_${eventId}`,
         }],
         [{
-          text: "🙅 не интересно",
+          text: "🤷 не интересно",
           callback_data: `game_deal_not_interested_${eventId}`,
         }],
       ],
@@ -95,107 +155,33 @@ export function eventKeyboard(event: ExternalEventRow): InlineKeyboardMarkup {
 
   return {
     inline_keyboard: [
-      [{ text: "✅ done", callback_data: `event_done_${eventId}` }],
-      [{ text: "⏳ mute 45m", callback_data: `event_mute_${eventId}` }],
-      [{ text: "📅 tomorrow", callback_data: `event_tomorrow_${eventId}` }],
+      [{ text: "✅ готово", callback_data: `event_done_${eventId}` }],
+      [{
+        text: "⏳ отложить на 45 минут",
+        callback_data: `event_mute_${eventId}`,
+      }],
+      [{
+        text: "📅 напомнить завтра",
+        callback_data: `event_tomorrow_${eventId}`,
+      }],
     ],
   };
 }
 
-function isGameDealEvent(event: ExternalEventRow): boolean {
-  return event.sources?.kind === "steam_wishlist" ||
-    event.sources?.kind === "epic_games";
-}
-
-function formatGameDealAlertMessage(
-  event: ExternalEventRow,
-  timeZone: string,
-): string {
-  return event.sources?.kind === "steam_wishlist"
-    ? formatSteamDealAlertMessage(event)
-    : formatEpicDealAlertMessage(event, timeZone);
-}
-
-function formatSteamDealAlertMessage(event: ExternalEventRow): string {
-  const name = payloadString(event, "name") || stripSteamDealTitle(event.title);
-  const finalPriceKzt = payloadNumber(event, "final_price_kzt");
-  const originalPriceKzt = payloadNumber(event, "original_price_kzt");
-  const discountPercent = payloadNumber(event, "discount_percent");
-  const storeUrl = payloadString(event, "store_url") ||
-    `https://store.steampowered.com/app/${
-      encodeURIComponent(event.external_id)
-    }`;
+function formatGameDealAlertMessage(event: ExternalEventRow): string {
+  const deal = getDealSnapshot(event);
+  if (!deal) {
+    return `🎮 ${escapeHtml(event.title)}`;
+  }
 
   return [
-    `🎮 <b>Steam скидка: ${escapeHtml(name)}</b>`,
-    `💸 <b>Цена:</b> ${escapeHtml(formatKztAmount(finalPriceKzt))}`,
-    `📉 <b>Скидка:</b> ${escapeHtml(formatDiscount(discountPercent))}`,
-    `🏷 <b>Было:</b> ${escapeHtml(formatKztAmount(originalPriceKzt))}`,
-    `🔗 ${escapeHtml(storeUrl)}`,
+    `🎮 <b>${escapeHtml(deal.name)}</b>`,
+    `💸 Цена: ${escapeHtml(formatKztAmount(deal.finalPriceKzt))} (было ${
+      escapeHtml(formatKztAmount(deal.originalPriceKzt))
+    })`,
+    `📉 Скидка: ${escapeHtml(formatDiscountPercent(deal.discountPercent))}`,
+    `🔗 ${escapeHtml(deal.storeUrl)}`,
   ].join("\n");
-}
-
-function formatEpicDealAlertMessage(
-  event: ExternalEventRow,
-  timeZone: string,
-): string {
-  const name = payloadString(event, "name") ||
-    payloadString(event, "title") ||
-    stripEpicDealTitle(event.title);
-  const storeUrl = payloadString(event, "store_url");
-  const dueAt = event.due_at ? formatRuDateTime(event.due_at, timeZone) : null;
-
-  return [
-    `🎁 <b>Забрать бесплатно: ${escapeHtml(name)}</b>`,
-    `🛒 <b>Магазин:</b> ${escapeHtml("Epic Games")}`,
-    `⏳ <b>До:</b> ${escapeHtml(dueAt || "неизвестно")}`,
-    storeUrl ? `🔗 ${escapeHtml(storeUrl)}` : null,
-  ].filter(Boolean).join("\n");
-}
-
-function payloadString(event: ExternalEventRow, key: string): string | null {
-  const value = event.raw_payload_json?.[key];
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function payloadNumber(event: ExternalEventRow, key: string): number | null {
-  const value = event.raw_payload_json?.[key];
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  if (typeof value !== "string" || !value.trim()) {
-    return null;
-  }
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function stripSteamDealTitle(title: string): string {
-  return title.replace(/^🎮\s*Steam скидка:\s*/u, "")
-    .replace(/\s+—\s+-\d+(?:[.,]\d+)?%$/u, "")
-    .trim() || title;
-}
-
-function stripEpicDealTitle(title: string): string {
-  return title.replace(/^🎁\s*Бесплатно в Epic Games:\s*/u, "").trim() ||
-    title;
-}
-
-function formatKztAmount(value: number | null): string {
-  if (value === null) {
-    return "неизвестно";
-  }
-  return `${formatDealNumber(value)} ₸`;
-}
-
-function formatDiscount(value: number | null): string {
-  return value === null ? "неизвестно" : `-${formatDealNumber(value)}%`;
-}
-
-function formatDealNumber(value: number): string {
-  return new Intl.NumberFormat("ru-RU", {
-    maximumFractionDigits: Number.isInteger(value) ? 0 : 2,
-  }).format(value);
 }
 
 function formatWhen(
@@ -206,7 +192,7 @@ function formatWhen(
   if (isDateOnlyGoogleTask(event) && event.due_date) {
     return `${formatRuDateOnly(event.due_date, timeZone)} (без времени)`;
   }
-  return fallbackIso ? formatDateTime(fallbackIso, timeZone) : "no time";
+  return fallbackIso ? formatDateTime(fallbackIso, timeZone) : "без времени";
 }
 
 function isDateOnlyGoogleTask(event: ExternalEventRow): boolean {

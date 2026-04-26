@@ -64,7 +64,7 @@ export async function parseIcsCalendar(
     const props = groupProperties(event);
     const uid = firstValue(props, "UID");
     const title = decodeText(
-      firstValue(props, "SUMMARY") || "Untitled ICS event",
+      firstValue(props, "SUMMARY") || "Событие без названия",
     );
     const description = nullableText(firstValue(props, "DESCRIPTION"));
     const location = nullableText(firstValue(props, "LOCATION"));

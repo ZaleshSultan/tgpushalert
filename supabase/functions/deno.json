@@ -1,4 +1,7 @@
 {
+  "compilerOptions": {
+    "strict": true
+  },
   "tasks": {
     "check": "deno check sync-moodle-calendar/index.ts sync-steam-wishlist/index.ts sync-epic-games/index.ts dispatch-alerts/index.ts telegram-webhook/index.ts"
   },

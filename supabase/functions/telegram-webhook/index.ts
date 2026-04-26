@@ -1,11 +1,23 @@
 import {
   getAppTimezone,
+  getFunctionPublicUrl,
   getRequiredEnv,
   handleFunctionError,
   HttpError,
   jsonResponse,
 } from "../_shared/env.ts";
-import { formatTodayLine } from "../_shared/events.ts";
+import {
+  compareDealEvents,
+  formatDealListLine,
+  formatTodayLine,
+} from "../_shared/events.ts";
+import {
+  dealKindLabel,
+  formatDiscountPercent,
+  formatKztAmount,
+  getDealSnapshot,
+  isGameDealEvent,
+} from "../_shared/deals.ts";
 import {
   ensureSource,
   type ExternalEventRow,
@@ -13,12 +25,15 @@ import {
   type SourceRow,
   supabaseRequest,
   type SyncRunRow,
+  upsertEventUserAction,
   upsertExternalEvents,
 } from "../_shared/supabase.ts";
 import {
   answerCallbackQuery,
+  editMessageCaption,
   editMessageText,
   escapeHtml,
+  type InlineKeyboardMarkup,
   isAllowedChat,
   sendTelegramMessage,
 } from "../_shared/telegram.ts";
@@ -67,6 +82,8 @@ interface BotMetaRow {
 }
 
 type AddTaskStep = "awaiting_details" | "awaiting_due_at" | "awaiting_photo";
+type DealListFilter = "all" | "free" | "discounts" | "wishlist";
+type GameDealAction = "done" | "later" | "no_money" | "not_interested";
 
 interface AddTaskState {
   step: AddTaskStep;
@@ -81,11 +98,16 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204 });
   }
-  if (req.method !== "POST") {
-    return jsonResponse({ ok: true, service: "telegram-webhook" });
-  }
 
   try {
+    const url = new URL(req.url);
+    if (req.method !== "POST") {
+      if (url.searchParams.get("view") === "dashboard") {
+        return await renderDashboardResponse(url);
+      }
+      return jsonResponse({ ok: true, service: "telegram-webhook" });
+    }
+
     assertTelegramWebhookSecret(req);
     const update = await req.json() as TelegramUpdate;
 
@@ -112,12 +134,34 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     : "";
   if (command === "/today") {
     await sendTelegramMessage(message.chat.id, await buildTodayMessage());
+  } else if (command === "/wishlist") {
+    await sendTelegramMessage(
+      message.chat.id,
+      await buildDealsMessage("wishlist"),
+      dashboardKeyboard("wishlist"),
+    );
+  } else if (command === "/deals") {
+    await sendTelegramMessage(
+      message.chat.id,
+      await buildDealsMessage("all"),
+      dashboardKeyboard("all"),
+    );
+  } else if (command === "/free") {
+    await sendTelegramMessage(
+      message.chat.id,
+      await buildDealsMessage("free"),
+      dashboardKeyboard("free"),
+    );
   } else if (command === "/status") {
-    await sendTelegramMessage(message.chat.id, await buildStatusMessage());
+    await sendTelegramMessage(
+      message.chat.id,
+      await buildStatusMessage(),
+      dashboardKeyboard("all"),
+    );
   } else if (command === "/test") {
     await sendTelegramMessage(
       message.chat.id,
-      "Test message OK. Telegram webhook is alive.",
+      "Тестовое сообщение отправлено. Webhook работает.",
     );
   } else if (command === "/addtask") {
     await startAddTaskFlow(message.chat.id);
@@ -128,7 +172,11 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       "Диалог добавления задачи отменен.",
     );
   } else if (command === "/help" || command === "/start") {
-    await sendTelegramMessage(message.chat.id, buildHelpMessage());
+    await sendTelegramMessage(
+      message.chat.id,
+      buildHelpMessage(),
+      dashboardKeyboard("all"),
+    );
   } else {
     const state = await loadAddTaskState(message.chat.id);
     if (state) {
@@ -234,7 +282,7 @@ async function handleTaskDueAtStep(
   });
   await sendTelegramMessage(
     message.chat.id,
-    "Отправьте картинку для этой задачи (или напишите 'без картинки'):",
+    "Отправьте картинку для этой задачи или напишите 'без картинки':",
   );
 }
 
@@ -280,12 +328,12 @@ async function createPersonalTaskEvent(
   photoId: string | null,
 ): Promise<ExternalEventRow> {
   if (!state.title) {
-    throw new Error("Cannot create personal task without a title");
+    throw new Error("Нельзя создать задачу без названия");
   }
 
   const source = await ensureSource("personal_tasks", "Personal Tasks");
   if (!source.is_enabled) {
-    throw new Error("Personal Tasks source is disabled");
+    throw new Error("Источник Personal Tasks отключен");
   }
 
   const rows = await upsertExternalEvents([{
@@ -474,7 +522,7 @@ function normalizeAddTaskState(
 async function handleCallback(query: TelegramCallbackQuery): Promise<void> {
   const message = query.message;
   if (!message || !isAllowedChat(message.chat.id)) {
-    await answerCallbackQuery(query.id, "Ignored");
+    await answerCallbackQuery(query.id, "Игнорирую");
     return;
   }
 
@@ -484,34 +532,37 @@ async function handleCallback(query: TelegramCallbackQuery): Promise<void> {
   );
   if (gameDealMatch) {
     const [, action, eventId] = gameDealMatch;
-    await handleGameDealCallback(query, message, action, eventId);
+    await handleGameDealCallback(
+      query,
+      message,
+      action as GameDealAction,
+      eventId,
+    );
     return;
   }
 
   const match = data.match(/^event_(done|mute|tomorrow)_([0-9a-f-]{36})$/i);
   if (!match) {
-    await answerCallbackQuery(query.id, "Unsupported action");
+    await answerCallbackQuery(query.id, "Неизвестное действие");
     return;
   }
 
   const [, action, eventId] = match;
   if (action === "done") {
     await updateEventStatus(eventId, "done");
-    await answerCallbackQuery(query.id, "Marked done");
-    await editMessageText(
-      message.chat.id,
-      message.message_id,
-      "✅ Marked done.",
+    await answerCallbackQuery(query.id, "Готово");
+    await editTelegramMessage(
+      message,
+      "✅ Отметил как выполненное.",
     );
   } else if (action === "mute") {
     const until = new Date(Date.now() + 45 * 60000);
     await muteEvent(eventId, until, "telegram_callback:mute_45m");
     await resetNotificationState(eventId);
-    await answerCallbackQuery(query.id, "Muted for 45 minutes");
-    await editMessageText(
-      message.chat.id,
-      message.message_id,
-      `⏳ Muted until ${
+    await answerCallbackQuery(query.id, "Отложил на 45 минут");
+    await editTelegramMessage(
+      message,
+      `⏳ Напомню снова: ${
         escapeHtml(formatDateTime(until.toISOString(), getAppTimezone()))
       }.`,
     );
@@ -519,11 +570,10 @@ async function handleCallback(query: TelegramCallbackQuery): Promise<void> {
     const until = tomorrowAtLocalHour(getAppTimezone(), 9);
     await muteEvent(eventId, until, "telegram_callback:tomorrow_9am");
     await resetNotificationState(eventId);
-    await answerCallbackQuery(query.id, "Snoozed until tomorrow");
-    await editMessageText(
-      message.chat.id,
-      message.message_id,
-      `📅 Snoozed until ${
+    await answerCallbackQuery(query.id, "Напомню завтра");
+    await editTelegramMessage(
+      message,
+      `📅 Перенес на ${
         escapeHtml(formatDateTime(until.toISOString(), getAppTimezone()))
       }.`,
     );
@@ -533,15 +583,26 @@ async function handleCallback(query: TelegramCallbackQuery): Promise<void> {
 async function handleGameDealCallback(
   query: TelegramCallbackQuery,
   message: TelegramMessage,
-  action: string,
+  action: GameDealAction,
   eventId: string,
 ): Promise<void> {
+  await upsertEventUserAction({
+    event_id: eventId,
+    chat_id: String(message.chat.id),
+    action,
+    payload_json: {
+      callback_query_id: query.id,
+      callback_data: query.data || "",
+      message_id: message.message_id,
+      recorded_at: new Date().toISOString(),
+    },
+  });
+
   if (action === "done") {
     await updateEventStatus(eventId, "done");
-    await answerCallbackQuery(query.id, "Marked done");
-    await editMessageText(
-      message.chat.id,
-      message.message_id,
+    await answerCallbackQuery(query.id, "Отметил");
+    await editTelegramMessage(
+      message,
       "✅ Куплено/забрано.",
     );
     return;
@@ -551,10 +612,9 @@ async function handleGameDealCallback(
     const until = new Date(Date.now() + 24 * 60 * 60000);
     await muteEvent(eventId, until, "telegram_callback:game_deal_later_24h");
     await resetNotificationState(eventId);
-    await answerCallbackQuery(query.id, "Snoozed for 24 hours");
-    await editMessageText(
-      message.chat.id,
-      message.message_id,
+    await answerCallbackQuery(query.id, "Напомню позже");
+    await editTelegramMessage(
+      message,
       `⏳ Напомню позже: ${
         escapeHtml(formatDateTime(until.toISOString(), getAppTimezone()))
       }.`,
@@ -566,26 +626,22 @@ async function handleGameDealCallback(
     const until = new Date(Date.now() + 7 * 24 * 60 * 60000);
     await muteEvent(eventId, until, "telegram_callback:game_deal_no_money_7d");
     await resetNotificationState(eventId);
-    await answerCallbackQuery(query.id, "Muted for 7 days");
-    await editMessageText(
-      message.chat.id,
-      message.message_id,
-      `💸 Отложено до ${
+    await answerCallbackQuery(query.id, "Отложил");
+    await editTelegramMessage(
+      message,
+      `💸 Вернусь к этому позже: ${
         escapeHtml(formatDateTime(until.toISOString(), getAppTimezone()))
       }.`,
     );
     return;
   }
 
-  if (action === "not_interested") {
-    await updateEventStatus(eventId, "cancelled");
-    await answerCallbackQuery(query.id, "Cancelled");
-    await editMessageText(
-      message.chat.id,
-      message.message_id,
-      "🙅 Больше не интересно.",
-    );
-  }
+  await updateEventStatus(eventId, "cancelled");
+  await answerCallbackQuery(query.id, "Скрываю");
+  await editTelegramMessage(
+    message,
+    "🤷 Больше не интересно.",
+  );
 }
 
 async function buildTodayMessage(): Promise<string> {
@@ -604,13 +660,35 @@ async function buildTodayMessage(): Promise<string> {
     });
 
   if (today.length === 0) {
-    return "No active deadlines or events for today.";
+    return "На сегодня активных событий и дедлайнов нет.";
   }
 
   return [
-    `<b>Today</b>`,
+    "<b>Сегодня</b>",
     ...today.slice(0, 25).map((event) => formatTodayLine(event, timeZone)),
-    today.length > 25 ? `...and ${today.length - 25} more` : null,
+    today.length > 25 ? `...и еще ${today.length - 25}` : null,
+  ].filter(Boolean).join("\n");
+}
+
+async function buildDealsMessage(filter: DealListFilter): Promise<string> {
+  const timeZone = getAppTimezone();
+  const deals = (await loadActiveEvents())
+    .filter((event) => isGameDealEvent(event))
+    .filter((event) => matchesDealFilter(event, filter))
+    .sort(compareDealEvents);
+
+  if (deals.length === 0) {
+    return emptyDealsMessage(filter);
+  }
+
+  const header = dealsHeader(filter);
+  const visible = deals.slice(0, 20);
+  return [
+    header,
+    ...visible.map((event) => formatDealListLine(event, timeZone)),
+    deals.length > visible.length
+      ? `...показано ${visible.length} из ${deals.length}. Полный список есть в дашборде.`
+      : null,
   ].filter(Boolean).join("\n");
 }
 
@@ -620,39 +698,57 @@ async function buildStatusMessage(): Promise<string> {
     queryString({
       select: "*",
       is_enabled: "eq.true",
+      order: "name.asc",
     })
   }`);
   const events = await loadActiveEvents();
+  const dealEvents = events.filter((event) => isGameDealEvent(event));
   const runs = await supabaseRequest<SyncRunRow[]>(`sync_runs?${
     queryString({
-      select: "*",
+      select: "*,sources(kind,name)",
       order: "started_at.desc",
-      limit: 1,
+      limit: 20,
     })
   }`);
-  const lastRun = runs[0];
-  const lastSync = lastRun
-    ? `${lastRun.status} at ${formatDateTime(lastRun.started_at, timeZone)}`
-    : "no sync runs yet";
+  const latestBySource = new Map<string, SyncRunRow>();
+  for (const run of runs) {
+    const sourceKind = run.sources?.kind;
+    if (sourceKind && !latestBySource.has(sourceKind)) {
+      latestBySource.set(sourceKind, run);
+    }
+  }
+
+  const runLines = [...latestBySource.values()]
+    .slice(0, 6)
+    .map((run) =>
+      `- ${escapeHtml(run.sources?.name || "Источник")} — ${
+        escapeHtml(syncStatusLabel(run.status))
+      }, ${escapeHtml(formatDateTime(run.started_at, timeZone))}`
+    );
 
   return [
-    "<b>Status</b>",
-    "Bot: alive",
-    `Active sources: ${sources.length}`,
-    `Active events: ${events.length}`,
-    `Last sync: ${escapeHtml(lastSync)}`,
-  ].join("\n");
+    "<b>Статус системы</b>",
+    "Бот: работает",
+    `Активных источников: ${sources.length}`,
+    `Активных событий: ${events.length}`,
+    `Активных игровых сделок: ${dealEvents.length}`,
+    runLines.length > 0 ? "<b>Последняя синхронизация</b>" : null,
+    ...runLines,
+    runLines.length === 0 ? "Запусков синхронизации пока нет." : null,
+  ].filter(Boolean).join("\n");
 }
 
 function buildHelpMessage(): string {
   return [
-    "<b>Commands</b>",
-    "/today - deadlines and events for today",
-    "/status - bot health and latest sync",
-    "/test - send a test response",
-    "/addtask - add a personal task with optional image",
-    "/cancel - cancel the current dialog",
-    "/help - show this help",
+    "<b>Команды</b>",
+    "/today - события и дедлайны на сегодня",
+    "/wishlist - активные скидки из Steam Wishlist",
+    "/deals - все активные игровые предложения",
+    "/free - только бесплатные раздачи",
+    "/status - состояние системы и последняя синхронизация",
+    "/addtask - добавить личную задачу",
+    "/cancel - отменить текущий диалог",
+    "/help - показать справку",
   ].join("\n");
 }
 
@@ -668,6 +764,309 @@ async function loadActiveEvents(): Promise<ExternalEventRow[]> {
       })
     }`,
   );
+}
+
+function matchesDealFilter(
+  event: ExternalEventRow,
+  filter: DealListFilter,
+): boolean {
+  const deal = getDealSnapshot(event);
+  if (!deal) {
+    return false;
+  }
+
+  switch (filter) {
+    case "free":
+      return deal.dealKind === "free";
+    case "discounts":
+      return deal.dealKind === "huge_discount" ||
+        deal.dealKind === "discount" ||
+        deal.dealKind === "cheap";
+    case "wishlist":
+      return event.sources?.kind === "steam_wishlist";
+    default:
+      return true;
+  }
+}
+
+function dealsHeader(filter: DealListFilter): string {
+  switch (filter) {
+    case "free":
+      return "<b>Бесплатные игры</b>";
+    case "discounts":
+      return "<b>Скидки</b>";
+    case "wishlist":
+      return "<b>Steam Wishlist</b>";
+    default:
+      return "<b>Активные игровые предложения</b>";
+  }
+}
+
+function emptyDealsMessage(filter: DealListFilter): string {
+  switch (filter) {
+    case "free":
+      return "Сейчас нет активных бесплатных раздач.";
+    case "discounts":
+      return "Сейчас нет активных скидок.";
+    case "wishlist":
+      return "В Steam Wishlist сейчас нет подходящих сделок.";
+    default:
+      return "Сейчас нет активных игровых предложений.";
+  }
+}
+
+function dashboardKeyboard(filter: DealListFilter): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [[{
+      text: "📊 Открыть дашборд",
+      url: dashboardUrl(filter),
+    }]],
+  };
+}
+
+function dashboardUrl(filter: DealListFilter): string {
+  return getFunctionPublicUrl("telegram-webhook", {
+    view: "dashboard",
+    filter,
+  });
+}
+
+async function renderDashboardResponse(url: URL): Promise<Response> {
+  const filter = parseDealFilter(url.searchParams.get("filter"));
+  const events = (await loadActiveEvents())
+    .filter((event) => isGameDealEvent(event))
+    .filter((event) => matchesDealFilter(event, filter))
+    .sort(compareDealEvents);
+
+  const cards = events.map((event) => renderDealCard(event)).join("");
+  const html = `<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Дашборд скидок</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f6f2ea;
+        --surface: #fffaf1;
+        --ink: #1b1f18;
+        --muted: #5f6757;
+        --accent: #14705f;
+        --accent-soft: #d9efe9;
+        --border: #d7d0c3;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: linear-gradient(180deg, #fbf7ef 0%, var(--bg) 100%);
+        color: var(--ink);
+      }
+      main {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 24px 16px 48px;
+      }
+      .topbar {
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        align-items: flex-start;
+        flex-wrap: wrap;
+        margin-bottom: 20px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 32px;
+        line-height: 1.1;
+        letter-spacing: 0;
+      }
+      .meta {
+        color: var(--muted);
+        font-size: 14px;
+        margin-top: 6px;
+      }
+      .filters {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .filters a {
+        text-decoration: none;
+        color: var(--ink);
+        padding: 10px 14px;
+        border: 1px solid var(--border);
+        background: rgba(255,255,255,0.78);
+        border-radius: 8px;
+        font-size: 14px;
+      }
+      .filters a.active {
+        background: var(--accent-soft);
+        border-color: #93c7ba;
+        color: #0e5347;
+      }
+      .list {
+        display: grid;
+        gap: 12px;
+      }
+      .deal {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 16px;
+      }
+      .deal-top {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: flex-start;
+        margin-bottom: 10px;
+      }
+      .deal h2 {
+        margin: 0;
+        font-size: 20px;
+        line-height: 1.2;
+      }
+      .badge {
+        white-space: nowrap;
+        font-size: 13px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: #0d5a4c;
+      }
+      .deal-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 10px;
+        margin-bottom: 14px;
+      }
+      .label {
+        font-size: 12px;
+        color: var(--muted);
+        text-transform: uppercase;
+      }
+      .value {
+        font-size: 16px;
+        margin-top: 4px;
+      }
+      .actions a {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 120px;
+        padding: 10px 14px;
+        border-radius: 8px;
+        background: var(--accent);
+        color: white;
+        text-decoration: none;
+      }
+      .empty {
+        padding: 24px;
+        border: 1px dashed var(--border);
+        border-radius: 8px;
+        color: var(--muted);
+        background: rgba(255,255,255,0.45);
+      }
+      @media (max-width: 640px) {
+        h1 { font-size: 26px; }
+        .deal-top { flex-direction: column; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="topbar">
+        <div>
+          <h1>Дашборд скидок</h1>
+          <div class="meta">Фильтр: ${
+    escapeHtml(dealsHeader(filter).replace(/<[^>]+>/g, ""))
+  }. Активных предложений: ${events.length}</div>
+        </div>
+        <nav class="filters">
+          ${renderDashboardFilter("all", filter, "Все")}
+          ${renderDashboardFilter("free", filter, "Бесплатные")}
+          ${renderDashboardFilter("discounts", filter, "Скидки")}
+          ${renderDashboardFilter("wishlist", filter, "Steam Wishlist")}
+        </nav>
+      </div>
+      <section class="list">
+        ${
+    cards ||
+    '<div class="empty">Сейчас по этому фильтру ничего активного нет.</div>'
+  }
+      </section>
+    </main>
+  </body>
+</html>`;
+
+  return new Response(html, {
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+}
+
+function renderDashboardFilter(
+  target: DealListFilter,
+  current: DealListFilter,
+  label: string,
+): string {
+  const href = dashboardUrl(target);
+  const className = target === current ? "active" : "";
+  return `<a class="${className}" href="${escapeHtml(href)}">${
+    escapeHtml(label)
+  }</a>`;
+}
+
+function renderDealCard(event: ExternalEventRow): string {
+  const deal = getDealSnapshot(event);
+  if (!deal) {
+    return "";
+  }
+
+  const expiresAt = event.ends_at || event.due_at;
+  const expiresText = expiresAt
+    ? formatDateTime(expiresAt, getAppTimezone())
+    : "Не указано";
+
+  return `<article class="deal">
+    <div class="deal-top">
+      <div>
+        <h2>${escapeHtml(deal.name)}</h2>
+        <div class="meta">${escapeHtml(deal.storeLabel)}</div>
+      </div>
+      <div class="badge">${escapeHtml(dealKindLabel(deal.dealKind))}</div>
+    </div>
+    <div class="deal-grid">
+      <div>
+        <div class="label">Цена</div>
+        <div class="value">${
+    escapeHtml(formatKztAmount(deal.finalPriceKzt))
+  }</div>
+      </div>
+      <div>
+        <div class="label">Было</div>
+        <div class="value">${
+    escapeHtml(formatKztAmount(deal.originalPriceKzt))
+  }</div>
+      </div>
+      <div>
+        <div class="label">Скидка</div>
+        <div class="value">-${
+    escapeHtml(formatDiscountPercent(deal.discountPercent))
+  }</div>
+      </div>
+      <div>
+        <div class="label">Актуально до</div>
+        <div class="value">${escapeHtml(expiresText)}</div>
+      </div>
+    </div>
+    <div class="actions">
+      <a href="${
+    escapeHtml(deal.storeUrl)
+  }" target="_blank" rel="noreferrer">Открыть магазин</a>
+    </div>
+  </article>`;
 }
 
 async function updateEventStatus(
@@ -709,6 +1108,41 @@ async function resetNotificationState(eventId: string): Promise<void> {
       headers: { prefer: "return=minimal" },
     },
   );
+}
+
+async function editTelegramMessage(
+  message: TelegramMessage,
+  text: string,
+): Promise<void> {
+  if (message.photo?.length || message.caption) {
+    await editMessageCaption(message.chat.id, message.message_id, text);
+    return;
+  }
+
+  await editMessageText(message.chat.id, message.message_id, text);
+}
+
+function syncStatusLabel(status: SyncRunRow["status"]): string {
+  switch (status) {
+    case "success":
+      return "успешно";
+    case "error":
+      return "ошибка";
+    default:
+      return "идет";
+  }
+}
+
+function parseDealFilter(value: string | null): DealListFilter {
+  if (
+    value === "all" ||
+    value === "free" ||
+    value === "discounts" ||
+    value === "wishlist"
+  ) {
+    return value;
+  }
+  return "all";
 }
 
 function assertTelegramWebhookSecret(req: Request): void {

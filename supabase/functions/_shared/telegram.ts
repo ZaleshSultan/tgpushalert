@@ -3,11 +3,20 @@ import { fetchWithTimeout } from "./http.ts";
 
 export interface InlineKeyboardButton {
   text: string;
-  callback_data: string;
+  callback_data?: string;
+  url?: string;
+  web_app?: {
+    url: string;
+  };
 }
 
 export interface InlineKeyboardMarkup {
   inline_keyboard: InlineKeyboardButton[][];
+}
+
+export interface TelegramSendOptions {
+  replyMarkup?: InlineKeyboardMarkup;
+  disableNotification?: boolean;
 }
 
 interface TelegramResponse<T> {
@@ -71,14 +80,16 @@ export async function telegramApi<T>(
 export async function sendTelegramMessage(
   chatId: string | number,
   text: string,
-  replyMarkup?: InlineKeyboardMarkup,
+  options?: InlineKeyboardMarkup | TelegramSendOptions,
 ): Promise<void> {
+  const normalized = normalizeSendOptions(options);
   await telegramApi("sendMessage", {
     chat_id: chatId,
     text,
     parse_mode: "HTML",
     disable_web_page_preview: true,
-    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    ...(normalized.disableNotification ? { disable_notification: true } : {}),
+    ...(normalized.replyMarkup ? { reply_markup: normalized.replyMarkup } : {}),
   });
 }
 
@@ -86,14 +97,16 @@ export async function sendTelegramPhoto(
   chatId: string | number,
   photoFileId: string,
   caption: string,
-  replyMarkup?: InlineKeyboardMarkup,
+  options?: InlineKeyboardMarkup | TelegramSendOptions,
 ): Promise<void> {
+  const normalized = normalizeSendOptions(options);
   await telegramApi("sendPhoto", {
     chat_id: chatId,
     photo: photoFileId,
     caption,
     parse_mode: "HTML",
-    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    ...(normalized.disableNotification ? { disable_notification: true } : {}),
+    ...(normalized.replyMarkup ? { reply_markup: normalized.replyMarkup } : {}),
   });
 }
 
@@ -119,4 +132,29 @@ export async function editMessageText(
     parse_mode: "HTML",
     disable_web_page_preview: true,
   });
+}
+
+export async function editMessageCaption(
+  chatId: number | string,
+  messageId: number,
+  caption: string,
+): Promise<void> {
+  await telegramApi("editMessageCaption", {
+    chat_id: chatId,
+    message_id: messageId,
+    caption,
+    parse_mode: "HTML",
+  });
+}
+
+function normalizeSendOptions(
+  options?: InlineKeyboardMarkup | TelegramSendOptions,
+): TelegramSendOptions {
+  if (!options) {
+    return {};
+  }
+  if ("inline_keyboard" in options) {
+    return { replyMarkup: options };
+  }
+  return options;
 }

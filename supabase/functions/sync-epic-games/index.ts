@@ -5,6 +5,7 @@ import {
   jsonResponse,
 } from "../_shared/env.ts";
 import { sha256Hex } from "../_shared/checksum.ts";
+import { classifyDeal } from "../_shared/deals.ts";
 import { fetchJsonWithTimeout } from "../_shared/http.ts";
 import {
   ensureSource,
@@ -85,6 +86,7 @@ async function syncEpicGames(): Promise<SyncResponse> {
     sourceId = source.id;
 
     if (!source.is_enabled) {
+      console.log("[sync-epic-games] source disabled");
       return {
         success: true,
         ok: true,
@@ -105,6 +107,11 @@ async function syncEpicGames(): Promise<SyncResponse> {
       .toUpperCase() || DEFAULT_COUNTRY;
     const locale = getOptionalEnv("EPIC_LOCALE", DEFAULT_LOCALE).trim() ||
       DEFAULT_LOCALE;
+    console.log("[sync-epic-games] started", {
+      sourceId: source.id,
+      country,
+      locale,
+    });
     const payload = await fetchJsonWithTimeout<EpicApiResponse>(
       epicPromotionsUrl(country, locale),
       {
@@ -157,6 +164,13 @@ async function syncEpicGames(): Promise<SyncResponse> {
       new Set(rows.map((row) => row.external_id)),
     );
 
+    console.log("[sync-epic-games] completed", {
+      processed,
+      upserted,
+      skipped,
+      missing,
+    });
+
     await finishSyncRun(run.id, "success", processed, upserted);
     return {
       success: true,
@@ -171,6 +185,12 @@ async function syncEpicGames(): Promise<SyncResponse> {
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    console.error("[sync-epic-games] failed", {
+      message,
+      processed,
+      upserted,
+      skipped,
+    });
     if (runId) {
       await finishSyncRun(runId, "error", processed, upserted, message);
     }
@@ -220,8 +240,17 @@ async function epicGameToEventRow(params: {
     return null;
   }
 
-  const discount = numberValue(price.raw.discount);
-  if (discount !== null && discount < price.originalPrice) {
+  const finalPriceKzt = price.discountPrice / 10 ** price.decimals;
+  const originalPriceKzt = price.originalPrice / 10 ** price.decimals;
+  const discountPercent = Math.max(
+    0,
+    Math.round((1 - price.discountPrice / price.originalPrice) * 100),
+  );
+  const dealKind = classifyDeal({
+    finalPriceKzt,
+    discountPercent,
+  });
+  if (dealKind !== "free") {
     return null;
   }
 
@@ -230,19 +259,21 @@ async function epicGameToEventRow(params: {
     return null;
   }
 
-  const title = stringValue(game.title) || "Untitled Epic Games offer";
+  const title = stringValue(game.title) || "Безымянная раздача Epic Games";
   const pageSlug = epicPageSlug(game);
   const storeUrl = epicStoreUrl(pageSlug, productSlug(game), locale);
   const checksum = await sha256Hex([
     SOURCE_KIND,
     externalId,
     activeOffer.endDate,
+    discountPercent,
+    originalPriceKzt,
   ].join("|"));
 
   return {
     source_id: sourceId,
     external_id: externalId,
-    title: `🎁 Бесплатно в Epic Games: ${title}`,
+    title,
     description: [
       `Игра: ${title}`,
       `Бесплатно до: ${formatAlmatyDateTime(activeOffer.endDate)}`,
@@ -260,7 +291,7 @@ async function epicGameToEventRow(params: {
     remind_at: nowIso,
     raw_payload_json: {
       source_kind: SOURCE_KIND,
-      deal_kind: "free_claim",
+      deal_kind: dealKind,
       store: "epic_games",
       epic_id: stringValue(game.id),
       namespace: stringValue(game.namespace),
@@ -272,6 +303,9 @@ async function epicGameToEventRow(params: {
       country,
       locale,
       store_url: storeUrl,
+      final_price_kzt: finalPriceKzt,
+      original_price_kzt: originalPriceKzt,
+      discount_percent: discountPercent,
       should_create_google_task: true,
       should_push_telegram: true,
       price: price.raw,

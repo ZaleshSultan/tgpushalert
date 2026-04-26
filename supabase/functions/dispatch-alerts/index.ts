@@ -5,12 +5,14 @@ import {
   handleFunctionError,
   jsonResponse,
 } from "../_shared/env.ts";
+import { getDealSnapshot, isGameDealEvent } from "../_shared/deals.ts";
 import {
   chooseAlertType,
   eventKeyboard,
   formatAlertMessage,
 } from "../_shared/events.ts";
 import {
+  enqueueTaskCommand,
   type ExternalEventRow,
   type MutedItemRow,
   type NotificationStateRow,
@@ -22,6 +24,18 @@ import {
   sendTelegramMessage,
   sendTelegramPhoto,
 } from "../_shared/telegram.ts";
+import { localDateString, localTimeString } from "../_shared/time.ts";
+
+interface DispatchStats {
+  loaded_events: number;
+  muted: number;
+  filtered_no_alert_type: number;
+  candidates: number;
+  sent_telegram: number;
+  queued_google_tasks: number;
+  skipped_same_checksum: number;
+  skipped_ignore: number;
+}
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -35,6 +49,12 @@ Deno.serve(async (req) => {
     if (!chatId) {
       throw new Error("Missing TELEGRAM_CHAT_ID or CHAT_ID");
     }
+
+    const url = new URL(req.url);
+    const force = isTruthy(url.searchParams.get("force")) ||
+      isTruthy(req.headers.get("x-force-resend"));
+    const forceTasks = isTruthy(url.searchParams.get("force_tasks")) ||
+      isTruthy(req.headers.get("x-force-tasks"));
 
     const timeZone = getAppTimezone();
     const now = new Date();
@@ -53,38 +73,16 @@ Deno.serve(async (req) => {
       throw new Error("ALERT_LOOKAHEAD_HOURS must be a positive number");
     }
 
-    const pastFloor = new Date(now.getTime() - 2 * 60 * 60000);
-    const futureCeiling = new Date(now.getTime() + lookaheadHours * 60 * 60000);
-
-    const eventParams = queryString({
-      select: "*,sources(kind,name)",
-      status: "eq.active",
-      alert_at: "not.is.null",
-      and:
-        `(alert_at.gte.${pastFloor.toISOString()},alert_at.lte.${futureCeiling.toISOString()})`,
-      order: "alert_at.asc",
-      limit: 500,
-    });
-    const events = await supabaseRequest<ExternalEventRow[]>(
-      `external_events?${eventParams}`,
-    );
-
-    const mutedParams = queryString({
-      select: "*",
-      item_kind: "eq.event",
-      muted_until: `gt.${now.toISOString()}`,
-    });
-    const mutedItems = await supabaseRequest<MutedItemRow[]>(
-      `muted_items?${mutedParams}`,
-    );
-    const mutedEventIds = new Set(mutedItems.map((item) => item.item_ref));
-
-    const candidates = events
+    const events = await loadAlertWindowEvents(now, lookaheadHours);
+    const mutedEventIds = await loadMutedEventIds(now);
+    const routed = events
       .map((event) => ({ event, alertType: chooseAlertType(event, now) }))
       .filter((item): item is { event: ExternalEventRow; alertType: string } =>
         Boolean(item.alertType)
-      )
-      .filter((item) => !mutedEventIds.has(item.event.id));
+      );
+    const candidates = routed.filter((item) =>
+      !mutedEventIds.has(item.event.id)
+    );
 
     const states = await loadNotificationStates(
       candidates.map((item) => item.event.id),
@@ -93,54 +91,254 @@ Deno.serve(async (req) => {
       states.map((state) => [`${state.event_id}:${state.alert_type}`, state]),
     );
 
-    let sent = 0;
+    const stats: DispatchStats = {
+      loaded_events: events.length,
+      muted: routed.length - candidates.length,
+      filtered_no_alert_type: events.length - routed.length,
+      candidates: candidates.length,
+      sent_telegram: 0,
+      queued_google_tasks: 0,
+      skipped_same_checksum: 0,
+      skipped_ignore: 0,
+    };
+
+    console.log("[dispatch-alerts] started", {
+      loadedEvents: stats.loaded_events,
+      filteredNoAlertType: stats.filtered_no_alert_type,
+      candidates: stats.candidates,
+      muted: stats.muted,
+      force,
+      forceTasks,
+    });
+
     for (const candidate of candidates) {
-      const key = `${candidate.event.id}:${candidate.alertType}`;
       const signature = eventSignature(candidate.event);
-      const state = stateByKey.get(key);
-      if (state?.event_checksum === signature) {
+      const telegramKey = `${candidate.event.id}:${candidate.alertType}`;
+      const telegramState = stateByKey.get(telegramKey);
+      const isDuplicate = telegramState?.event_checksum === signature;
+
+      if (!force && isDuplicate) {
+        stats.skipped_same_checksum += 1;
+        console.log("[dispatch-alerts] skip duplicate", {
+          eventId: candidate.event.id,
+          alertType: candidate.alertType,
+          title: candidate.event.title,
+        });
         continue;
       }
 
-      const message = formatAlertMessage(candidate.event, timeZone);
-      const keyboard = eventKeyboard(candidate.event);
-      const photoId = telegramPhotoId(candidate.event);
-      if (photoId) {
-        await sendTelegramPhoto(
+      if (isGameDealEvent(candidate.event)) {
+        const deal = getDealSnapshot(candidate.event);
+        if (
+          !deal || candidate.alertType === null || deal.dealKind === "ignore"
+        ) {
+          stats.skipped_ignore += 1;
+          console.log("[dispatch-alerts] skip ignored deal", {
+            eventId: candidate.event.id,
+            title: candidate.event.title,
+          });
+          continue;
+        }
+
+        const disableNotification = deal.dealKind === "cheap";
+        await sendEventToTelegram(
           chatId,
-          photoId,
-          truncateTelegramCaption(message),
-          keyboard,
+          candidate.event,
+          timeZone,
+          disableNotification,
         );
-      } else {
-        await sendTelegramMessage(chatId, message, keyboard);
+        await recordNotification(
+          candidate.event.id,
+          candidate.alertType,
+          signature,
+          cooldownMinutes,
+        );
+        stateByKey.set(telegramKey, {
+          id: telegramState?.id || "",
+          event_id: candidate.event.id,
+          alert_type: candidate.alertType,
+          event_checksum: signature,
+          notified_at: now.toISOString(),
+          cooldown_until: null,
+        });
+        stats.sent_telegram += 1;
+
+        if (deal.dealKind === "free") {
+          const taskKey = `${candidate.event.id}:google_task`;
+          const taskState = stateByKey.get(taskKey);
+          const taskDuplicate = taskState?.event_checksum === signature;
+          if (!taskDuplicate || forceTasks) {
+            await queueGoogleTaskForDeal(chatId, candidate.event, timeZone);
+            await recordNotification(
+              candidate.event.id,
+              "google_task",
+              signature,
+              0,
+            );
+            stateByKey.set(taskKey, {
+              id: taskState?.id || "",
+              event_id: candidate.event.id,
+              alert_type: "google_task",
+              event_checksum: signature,
+              notified_at: now.toISOString(),
+              cooldown_until: null,
+            });
+            stats.queued_google_tasks += 1;
+          }
+        }
+
+        console.log("[dispatch-alerts] sent deal", {
+          eventId: candidate.event.id,
+          alertType: candidate.alertType,
+          dealKind: deal.dealKind,
+          force,
+        });
+        continue;
       }
+
+      await sendEventToTelegram(chatId, candidate.event, timeZone, false);
       await recordNotification(
         candidate.event.id,
         candidate.alertType,
         signature,
         cooldownMinutes,
       );
-      stateByKey.set(key, {
-        id: state?.id || "",
+      stateByKey.set(telegramKey, {
+        id: telegramState?.id || "",
         event_id: candidate.event.id,
         alert_type: candidate.alertType,
         event_checksum: signature,
         notified_at: now.toISOString(),
         cooldown_until: null,
       });
-      sent += 1;
+      stats.sent_telegram += 1;
+
+      console.log("[dispatch-alerts] sent regular event", {
+        eventId: candidate.event.id,
+        alertType: candidate.alertType,
+        title: candidate.event.title,
+        force,
+      });
     }
 
+    console.log("[dispatch-alerts] completed", stats);
     return jsonResponse({
       ok: true,
-      candidates: candidates.length,
-      sent,
+      force,
+      force_tasks: forceTasks,
+      ...stats,
     });
   } catch (error) {
     return handleFunctionError(error);
   }
 });
+
+async function loadAlertWindowEvents(
+  now: Date,
+  lookaheadHours: number,
+): Promise<ExternalEventRow[]> {
+  const pastFloor = new Date(now.getTime() - 2 * 60 * 60000);
+  const futureCeiling = new Date(now.getTime() + lookaheadHours * 60 * 60000);
+
+  const eventParams = queryString({
+    select: "*,sources(kind,name)",
+    status: "eq.active",
+    alert_at: "not.is.null",
+    and:
+      `(alert_at.gte.${pastFloor.toISOString()},alert_at.lte.${futureCeiling.toISOString()})`,
+    order: "alert_at.asc",
+    limit: 500,
+  });
+  return await supabaseRequest<ExternalEventRow[]>(
+    `external_events?${eventParams}`,
+  );
+}
+
+async function loadMutedEventIds(now: Date): Promise<Set<string>> {
+  const mutedParams = queryString({
+    select: "*",
+    item_kind: "eq.event",
+    muted_until: `gt.${now.toISOString()}`,
+  });
+  const mutedItems = await supabaseRequest<MutedItemRow[]>(
+    `muted_items?${mutedParams}`,
+  );
+  return new Set(mutedItems.map((item) => item.item_ref));
+}
+
+async function sendEventToTelegram(
+  chatId: string,
+  event: ExternalEventRow,
+  timeZone: string,
+  disableNotification: boolean,
+): Promise<void> {
+  const message = formatAlertMessage(event, timeZone);
+  const keyboard = eventKeyboard(event);
+  const photoId = telegramPhotoId(event);
+  if (photoId) {
+    await sendTelegramPhoto(
+      chatId,
+      photoId,
+      truncateTelegramCaption(message),
+      {
+        replyMarkup: keyboard,
+        disableNotification,
+      },
+    );
+    return;
+  }
+
+  await sendTelegramMessage(chatId, message, {
+    replyMarkup: keyboard,
+    disableNotification,
+  });
+}
+
+async function queueGoogleTaskForDeal(
+  chatId: string,
+  event: ExternalEventRow,
+  timeZone: string,
+): Promise<void> {
+  const deal = getDealSnapshot(event);
+  if (!deal) {
+    throw new Error(`Cannot queue Google Task for non-deal event ${event.id}`);
+  }
+
+  const dueDate = resolveTaskDueDate(event, timeZone);
+  const dueTime = resolveTaskDueTime(event, timeZone);
+  await enqueueTaskCommand({
+    chat_id: chatId,
+    title: `Забрать игру: ${deal.name}`,
+    due_date: dueDate,
+    due_time: dueTime,
+    timezone: timeZone,
+  });
+}
+
+function resolveTaskDueDate(event: ExternalEventRow, timeZone: string): string {
+  if (event.due_date) {
+    return event.due_date;
+  }
+
+  const dueSource = event.ends_at || event.due_at || event.remind_at;
+  if (dueSource) {
+    return localDateString(new Date(dueSource), timeZone);
+  }
+
+  return localDateString(new Date(), timeZone);
+}
+
+function resolveTaskDueTime(
+  event: ExternalEventRow,
+  timeZone: string,
+): string | null {
+  if (event.has_explicit_time === false) {
+    return null;
+  }
+
+  const dueSource = event.ends_at || event.due_at;
+  return dueSource ? localTimeString(new Date(dueSource), timeZone) : null;
+}
 
 async function loadNotificationStates(
   eventIds: string[],
@@ -220,4 +418,12 @@ function closeOpenTelegramTags(html: string): string {
   }
 
   return `${html}${stack.reverse().map((name) => `</${name}>`).join("")}`;
+}
+
+function isTruthy(value: string | null): boolean {
+  if (!value) {
+    return false;
+  }
+
+  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
 }

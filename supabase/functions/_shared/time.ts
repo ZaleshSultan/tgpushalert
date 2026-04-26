@@ -39,17 +39,21 @@ export function humanRelativeTime(target: Date, now = new Date()): string {
 }
 
 export function formatDateTime(iso: string, timeZone: string): string {
-  return new Intl.DateTimeFormat("en-GB", {
+  return new Intl.DateTimeFormat("ru-RU", {
     timeZone,
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(new Date(iso));
+    day: "numeric",
+    month: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(iso)).replace(" в ", ", ");
 }
 
 export function formatDateOnly(date: string, timeZone: string): string {
-  return new Intl.DateTimeFormat("en-GB", {
+  return new Intl.DateTimeFormat("ru-RU", {
     timeZone,
-    dateStyle: "medium",
+    day: "numeric",
+    month: "long",
   }).format(new Date(`${date}T12:00:00.000Z`));
 }
 
@@ -60,6 +64,14 @@ export function localDateString(date: Date, timeZone: string): string {
     parts.month.toString().padStart(2, "0"),
     parts.day.toString().padStart(2, "0"),
   ].join("-");
+}
+
+export function localTimeString(date: Date, timeZone: string): string {
+  const parts = zonedParts(date, timeZone);
+  return [
+    parts.hour.toString().padStart(2, "0"),
+    parts.minute.toString().padStart(2, "0"),
+  ].join(":");
 }
 
 export function addDaysToDateString(date: string, days: number): string {
