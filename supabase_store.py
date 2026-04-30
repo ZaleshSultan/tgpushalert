@@ -203,11 +203,13 @@ def google_calendar_event_to_row(source_id: str, event: dict[str, Any]) -> dict[
 def google_task_to_row(source_id: str, task: dict[str, Any]) -> dict[str, Any]:
     due_info = google_task_due_info(task)
     tasklist_id = task.get("tasklist_id", "default")
+    title = task.get("title") or "Untitled task"
+    notes = task.get("notes")
     return {
         "source_id": source_id,
         "external_id": f"{tasklist_id}:{task['id']}",
-        "title": task.get("title") or "Untitled task",
-        "description": task.get("notes"),
+        "title": title,
+        "description": notes,
         "location": None,
         "starts_at": None,
         "ends_at": None,
@@ -215,6 +217,7 @@ def google_task_to_row(source_id: str, task: dict[str, Any]) -> dict[str, Any]:
         "due_date": due_info["due_date"],
         "has_explicit_time": due_info["has_explicit_time"],
         "remind_at": due_info["remind_at"],
+        "is_important": google_task_is_important(title, notes),
         "raw_payload_json": task,
         "checksum": google_task_checksum(task, due_info),
         "status": google_task_status(task),
@@ -323,6 +326,13 @@ def google_task_checksum(task: dict[str, Any], due_info: dict[str, Any]) -> str 
         str(due_info.get("remind_at") or ""),
         str(due_info.get("has_explicit_time")),
     ])
+
+
+def google_task_is_important(title: str | None, notes: str | None) -> bool:
+    marker = "!важно"
+    title_value = (title or "").casefold()
+    notes_value = (notes or "").casefold()
+    return marker in title_value or marker in notes_value
 
 
 def parse_google_time(value: str | None) -> str | None:

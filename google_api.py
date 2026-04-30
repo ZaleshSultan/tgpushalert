@@ -11,7 +11,8 @@ from config import APP_TIMEZONE, GOOGLE_CREDENTIALS_PATH, GOOGLE_TASKLIST_ID, GO
 
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
-]    "https://www.googleapis.com/auth/tasks",фывфывфывфыфывфыфывф
+    "https://www.googleapis.com/auth/tasks",
+]
 
 
 _services = {}

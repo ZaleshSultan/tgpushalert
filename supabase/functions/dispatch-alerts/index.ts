@@ -24,14 +24,16 @@ import {
   sendTelegramMessage,
   sendTelegramPhoto,
 } from "../_shared/telegram.ts";
-import { localDateString, localTimeString } from "../_shared/time.ts";
+import { localTimeString } from "../_shared/time.ts";
 
 interface DispatchStats {
   loaded_events: number;
+  nag_candidates: number;
   muted: number;
   filtered_no_alert_type: number;
   candidates: number;
   sent_telegram: number;
+  sent_nag: number;
   queued_google_tasks: number;
   skipped_same_checksum: number;
   skipped_ignore: number;
@@ -72,8 +74,16 @@ Deno.serve(async (req) => {
     if (!Number.isFinite(lookaheadHours) || lookaheadHours <= 0) {
       throw new Error("ALERT_LOOKAHEAD_HOURS must be a positive number");
     }
+    const nagIntervalMinutes = Number(
+      getOptionalEnv("TASK_NAG_INTERVAL_MINUTES", "10"),
+    );
+    if (!Number.isFinite(nagIntervalMinutes) || nagIntervalMinutes < 1) {
+      throw new Error("TASK_NAG_INTERVAL_MINUTES must be at least 1");
+    }
 
     const events = await loadAlertWindowEvents(now, lookaheadHours);
+    const nagCandidates = await loadNagCandidates(now);
+    const nagEventIds = new Set(nagCandidates.map((event) => event.id));
     const mutedEventIds = await loadMutedEventIds(now);
     const routed = events
       .map((event) => ({ event, alertType: chooseAlertType(event, now) }))
@@ -81,7 +91,7 @@ Deno.serve(async (req) => {
         Boolean(item.alertType)
       );
     const candidates = routed.filter((item) =>
-      !mutedEventIds.has(item.event.id)
+      !mutedEventIds.has(item.event.id) && !nagEventIds.has(item.event.id)
     );
 
     const states = await loadNotificationStates(
@@ -93,10 +103,12 @@ Deno.serve(async (req) => {
 
     const stats: DispatchStats = {
       loaded_events: events.length,
+      nag_candidates: nagCandidates.length,
       muted: routed.length - candidates.length,
       filtered_no_alert_type: events.length - routed.length,
       candidates: candidates.length,
       sent_telegram: 0,
+      sent_nag: 0,
       queued_google_tasks: 0,
       skipped_same_checksum: 0,
       skipped_ignore: 0,
@@ -106,6 +118,7 @@ Deno.serve(async (req) => {
       loadedEvents: stats.loaded_events,
       filteredNoAlertType: stats.filtered_no_alert_type,
       candidates: stats.candidates,
+      nagCandidates: stats.nag_candidates,
       muted: stats.muted,
       force,
       forceTasks,
@@ -221,6 +234,33 @@ Deno.serve(async (req) => {
       });
     }
 
+    for (const event of nagCandidates) {
+      if (mutedEventIds.has(event.id)) {
+        continue;
+      }
+      if (!force && !shouldNagNow(event, now, nagIntervalMinutes)) {
+        continue;
+      }
+
+      await sendEventToTelegram(chatId, event, timeZone, false);
+      await recordNotification(
+        event.id,
+        "nag_10m",
+        eventSignature(event),
+        nagIntervalMinutes,
+      );
+      await markEventNagged(event.id, now);
+      stats.sent_telegram += 1;
+      stats.sent_nag += 1;
+
+      console.log("[dispatch-alerts] sent nag", {
+        eventId: event.id,
+        title: event.title,
+        dueDate: event.due_date,
+        force,
+      });
+    }
+
     console.log("[dispatch-alerts] completed", stats);
     return jsonResponse({
       ok: true,
@@ -254,6 +294,37 @@ async function loadAlertWindowEvents(
   );
 }
 
+async function loadNagCandidates(
+  now: Date,
+): Promise<ExternalEventRow[]> {
+  const sourceRows = await supabaseRequest<Array<{ id: string }>>(
+    `sources?${
+      queryString({
+        select: "id",
+        kind: "eq.google_tasks",
+        is_enabled: "eq.true",
+      })
+    }`,
+  );
+  if (sourceRows.length === 0) {
+    return [];
+  }
+
+  const sourceIds = sourceRows.map((row) => row.id);
+  const params = queryString({
+    select: "*,sources(kind,name)",
+    status: "eq.active",
+    source_id: `in.(${sourceIds.join(",")})`,
+    is_important: "eq.true",
+    alert_at: `lte.${now.toISOString()}`,
+    order: "alert_at.asc,updated_at.asc",
+    limit: 500,
+  });
+  return await supabaseRequest<ExternalEventRow[]>(
+    `external_events?${params}`,
+  );
+}
+
 async function loadMutedEventIds(now: Date): Promise<Set<string>> {
   const mutedParams = queryString({
     select: "*",
@@ -264,6 +335,32 @@ async function loadMutedEventIds(now: Date): Promise<Set<string>> {
     `muted_items?${mutedParams}`,
   );
   return new Set(mutedItems.map((item) => item.item_ref));
+}
+
+function shouldNagNow(
+  event: ExternalEventRow,
+  now: Date,
+  intervalMinutes: number,
+): boolean {
+  if (!event.last_nagged_at) {
+    return true;
+  }
+  const lastNagged = new Date(event.last_nagged_at);
+  if (Number.isNaN(lastNagged.getTime())) {
+    return true;
+  }
+  return now.getTime() >= lastNagged.getTime() + intervalMinutes * 60000;
+}
+
+async function markEventNagged(eventId: string, now: Date): Promise<void> {
+  await supabaseRequest<null>(
+    `external_events?${queryString({ id: `eq.${eventId}` })}`,
+    {
+      method: "PATCH",
+      headers: { prefer: "return=minimal" },
+      body: JSON.stringify({ last_nagged_at: now.toISOString() }),
+    },
+  );
 }
 
 async function sendEventToTelegram(

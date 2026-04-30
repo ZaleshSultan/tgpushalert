@@ -8,12 +8,16 @@ from dotenv import load_dotenv
 
 
 COMMANDS = [
-    {"command": "today", "description": "Show today's deadlines and events"},
-    {"command": "status", "description": "Show bot health and last sync"},
-    {"command": "test", "description": "Send a test response"},
-    {"command": "addtask", "description": "Add a personal task"},
-    {"command": "cancel", "description": "Cancel the current dialog"},
-    {"command": "help", "description": "Show commands and usage"},
+    {"command": "today", "description": "События и дедлайны на сегодня"},
+    {"command": "wishlist", "description": "Активные скидки из Steam Wishlist"},
+    {"command": "deals", "description": "Все активные игровые предложения"},
+    {"command": "free", "description": "Только бесплатные раздачи"},
+    {"command": "status", "description": "Состояние системы и синхронизация"},
+    {"command": "spend", "description": "Записать трату"},
+    {"command": "report", "description": "Финансовый отчет от ИИ"},
+    {"command": "addtask", "description": "Добавить личную задачу"},
+    {"command": "cancel", "description": "Отменить текущий диалог"},
+    {"command": "help", "description": "Показать справку"},
 ]
 
 
@@ -28,9 +32,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_TOKEN")
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
 
     command_scope = {"type": "chat", "chat_id": args.chat_id} if args.chat_id else {
         "type": "all_private_chats",
@@ -61,10 +65,13 @@ def telegram_api(token: str, method: str, payload: dict) -> dict:
             body = json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")
+        print(f"ERROR {method}: HTTP {error.code}: {detail}")
         raise RuntimeError(f"Telegram {method} failed: HTTP {error.code}: {detail}") from error
 
     if not body.get("ok"):
+        print(f"ERROR {method}: {body.get('description', body)}")
         raise RuntimeError(f"Telegram {method} failed: {body.get('description', body)}")
+    print(f"OK {method}")
     return body
 
 

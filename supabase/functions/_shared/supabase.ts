@@ -32,6 +32,8 @@ export interface ExternalEventRow {
   due_date?: string | null;
   has_explicit_time?: boolean;
   remind_at?: string | null;
+  is_important?: boolean;
+  last_nagged_at?: string | null;
   effective_at?: string | null;
   alert_at?: string | null;
   raw_payload_json: Record<string, unknown>;
@@ -54,6 +56,7 @@ export interface ExternalEventUpsert {
   due_date?: string | null;
   has_explicit_time?: boolean;
   remind_at?: string | null;
+  is_important?: boolean;
   raw_payload_json?: Record<string, unknown>;
   checksum?: string | null;
   status?: "active" | "missing" | "done" | "cancelled";
