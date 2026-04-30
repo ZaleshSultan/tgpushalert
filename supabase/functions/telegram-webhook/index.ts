@@ -171,6 +171,14 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       message.chat.id,
       "Диалог добавления задачи отменен.",
     );
+  } else if (command === "/spend" || command === "/s") {
+    await handleExpenseCommand(message, text);
+  } else if (command === "/report") {
+    await enqueueReportGeneration(message.chat.id);
+    await sendTelegramMessage(
+      message.chat.id,
+      "⏳ Собираю данные и генерирую отчет...",
+    );
   } else if (command === "/help" || command === "/start") {
     await sendTelegramMessage(
       message.chat.id,
@@ -485,6 +493,49 @@ async function clearAddTaskState(chatId: number): Promise<void> {
   );
 }
 
+async function handleExpenseCommand(
+  message: TelegramMessage,
+  text: string | undefined,
+): Promise<void> {
+  const rawText = text?.trim() || "";
+  const expenseText = rawText.replace(/^\/\S+\s*/, "").trim();
+  if (!expenseText) {
+    await sendTelegramMessage(
+      message.chat.id,
+      "Укажи трату после команды, например: /spend 450 кофе",
+    );
+    return;
+  }
+
+  await appendBotMetaEntry(`expense_log:${crypto.randomUUID()}`, {
+    text: expenseText,
+    chat_id: message.chat.id,
+    timestamp: new Date().toISOString(),
+  });
+  await sendTelegramMessage(message.chat.id, "✅ Записал.");
+}
+
+async function enqueueReportGeneration(chatId: number): Promise<void> {
+  await appendBotMetaEntry(`action:generate_report:${crypto.randomUUID()}`, {
+    chat_id: chatId,
+  });
+}
+
+async function appendBotMetaEntry(
+  key: string,
+  valueJson: Record<string, unknown>,
+): Promise<void> {
+  await supabaseRequest<null>("bot_meta", {
+    method: "POST",
+    headers: { prefer: "return=minimal" },
+    body: JSON.stringify([{
+      key,
+      value_json: valueJson,
+      updated_at: new Date().toISOString(),
+    }]),
+  });
+}
+
 function addTaskStateKey(chatId: number): string {
   return `telegram_addtask:${chatId}`;
 }
@@ -746,6 +797,8 @@ function buildHelpMessage(): string {
     "/deals - все активные игровые предложения",
     "/free - только бесплатные раздачи",
     "/status - состояние системы и последняя синхронизация",
+    "/spend или /s - записать трату",
+    "/report - собрать и прислать финансовый отчет",
     "/addtask - добавить личную задачу",
     "/cancel - отменить текущий диалог",
     "/help - показать справку",

@@ -121,6 +121,37 @@ def update_task_command(command_id: str, payload: dict[str, Any]) -> None:
     )
 
 
+def get_expense_logs() -> list[dict[str, Any]]:
+    query = urlencode({
+        "select": "key,value_json,updated_at",
+        "key": "like.expense_log:*",
+        "order": "updated_at.asc",
+    })
+    return request_json(f"bot_meta?{query}") or []
+
+
+def get_pending_reports() -> list[dict[str, Any]]:
+    query = urlencode({
+        "select": "key,value_json,updated_at",
+        "key": "like.action:generate_report:*",
+        "order": "updated_at.asc",
+    })
+    return request_json(f"bot_meta?{query}") or []
+
+
+def delete_bot_meta_keys(keys: list[str]) -> None:
+    cleaned = [key for key in keys if key]
+    if not cleaned:
+        return
+
+    key_filter = f"in.({','.join(cleaned)})"
+    request_json(
+        f"bot_meta?{urlencode({'key': key_filter})}",
+        method="DELETE",
+        prefer="return=minimal",
+    )
+
+
 def mark_missing_external_events(source_id: str, seen_external_ids: set[str]) -> int:
     query = urlencode({
         "select": "id,external_id",
