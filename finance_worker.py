@@ -148,7 +148,7 @@ def process_expense_logs(
         batch_duplicates = 0
 
         for row in rows:
-            attempts = int(row.get("processing_attempts") or 0)
+            attempts = _processing_attempts_from_item(row)
             try:
                 outcome = process_single_expense_entry(client, row)
             except ExpenseEntryError as exc:
@@ -218,7 +218,7 @@ def process_report_queue(
         batch_duplicates = 0
 
         for row in rows:
-            attempts = int(row.get("processing_attempts") or 0)
+            attempts = _processing_attempts_from_item(row)
             try:
                 payload = row.get("value_json") or {}
                 generate_weekly_report(
@@ -359,18 +359,53 @@ def claim_bot_meta_entries(
     batch_size: int,
     failed_only: bool,
 ) -> list[dict[str, Any]]:
-    rows = client.rpc(
-        "claim_bot_meta_entries",
-        {
-            "prefix_filter": prefix_filter,
-            "worker_name": _worker_name(),
-            "batch_size": batch_size,
-            "stale_after_minutes": config.FINANCE_STALE_CLAIM_MINUTES,
-            "max_attempts": config.FINANCE_MAX_PROCESSING_ATTEMPTS,
-            "failed_only": failed_only,
-        },
+    payload = {
+        "limit_size": batch_size,
+        "max_attempts": config.FINANCE_MAX_PROCESSING_ATTEMPTS,
+        "stale_after_minutes": config.FINANCE_STALE_CLAIM_MINUTES,
+        "failed_only": failed_only,
+    }
+    logger.info(
+        "claim_bot_meta_entries args prefix=%s payload=%s",
+        prefix_filter,
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
     )
-    return list(rows or [])
+    try:
+        rows = client.rpc("claim_bot_meta_entries", payload)
+    except SupabaseError as exc:
+        logger.error(
+            "claim_bot_meta_entries failed prefix=%s status=%s body=%s payload=%s",
+            prefix_filter,
+            exc.status_code,
+            exc.body,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        )
+        return []
+
+    claimed_rows = list(rows or [])
+    matched_rows = []
+    for row in claimed_rows:
+        key = str(row.get("key") or "")
+        if key.startswith(prefix_filter):
+            matched_rows.append(row)
+            continue
+
+        logger.warning(
+            "Re-queueing unexpected claimed row prefix=%s key=%s",
+            prefix_filter,
+            key,
+        )
+        try:
+            complete_bot_meta_entry(
+                client,
+                key,
+                "pending",
+                f"Re-queued from mismatched claim for {prefix_filter}",
+            )
+        except SupabaseError:
+            logger.exception("Failed to re-queue unexpected claimed row %s", key)
+
+    return matched_rows
 
 
 def complete_bot_meta_entry(
@@ -414,19 +449,38 @@ def run_loop(
     poll_seconds: int,
 ) -> int:
     logger.info("Starting finance worker loop with poll_seconds=%s", poll_seconds)
+    supabase_error_streak = 0
     while True:
-        expense_processed, expense_failed = process_expense_logs(
-            client,
-            batch_size=batch_size,
-            failed_only=False,
-            drain=True,
-        )
-        report_processed, report_failed = process_report_queue(
-            client,
-            batch_size=batch_size,
-            failed_only=False,
-            drain=True,
-        )
+        try:
+            expense_processed, expense_failed = process_expense_logs(
+                client,
+                batch_size=batch_size,
+                failed_only=False,
+                drain=True,
+            )
+            report_processed, report_failed = process_report_queue(
+                client,
+                batch_size=batch_size,
+                failed_only=False,
+                drain=True,
+            )
+        except SupabaseError as exc:
+            supabase_error_streak += 1
+            backoff_seconds = min(60, max(poll_seconds, 5) * supabase_error_streak)
+            logger.error(
+                "Supabase error in run loop status=%s body=%s backoff=%ss streak=%s",
+                exc.status_code,
+                exc.body,
+                backoff_seconds,
+                supabase_error_streak,
+            )
+            time.sleep(backoff_seconds)
+            continue
+        except Exception:
+            logger.exception("Fatal worker crash in run loop")
+            raise
+
+        supabase_error_streak = 0
         logger.info(
             "Loop tick finished: expenses=%s/%s reports=%s/%s",
             expense_processed,
@@ -512,6 +566,15 @@ def _optional_int(payload: dict[str, Any], key: str) -> int | None:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid optional integer {key!r}: {value!r}") from exc
+
+
+def _processing_attempts_from_item(item: dict[str, Any]) -> int:
+    payload = item.get("value_json") or {}
+    value = payload.get("processing_attempts", 0)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _mark_processing_failure(
