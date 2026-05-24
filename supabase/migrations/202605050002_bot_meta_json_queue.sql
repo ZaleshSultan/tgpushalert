@@ -1,3 +1,5 @@
+DROP FUNCTION IF EXISTS public.claim_bot_meta_entries(integer, integer, integer, boolean);
+
 create or replace function public.claim_bot_meta_entries(
   limit_size integer default 25,
   max_attempts integer default 3,
